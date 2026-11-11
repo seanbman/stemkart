@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import os
+import json
 import selectors
 import shutil
 import subprocess
@@ -12,12 +13,16 @@ from pathlib import Path
 
 import numpy as np
 
-from PyQt6.QtCore import QThread, QUrl, Qt, QSize, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont
+from PyQt6.QtCore import QDir, QThread, QUrl, Qt, QSize, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFileSystemModel, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
+    QButtonGroup,
+    QCheckBox,
     QFileDialog,
     QGridLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -29,6 +34,13 @@ from PyQt6.QtWidgets import (
     QSlider,
     QStyle,
     QSizePolicy,
+    QTabWidget,
+    QListWidget,
+    QListWidgetItem,
+    QSplitter,
+    QTreeView,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -37,6 +49,11 @@ from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 
 STEMS = ("vocals", "drums", "bass", "other")
 SUPPORTED_AUDIO = "Audio files (*.mp3 *.wav *.flac *.m4a *.ogg *.aac *.opus);;All files (*)"
+SUPPORTED_SUFFIXES = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac", ".opus"}
+
+
+def bundled_icon(name: str) -> QIcon:
+    return QIcon(str(Path(__file__).resolve().parent / "icons" / name))
 
 
 def pretty_name(value: str) -> str:
@@ -122,6 +139,134 @@ def wav_availability(path: Path, threshold_dbfs: float = -60.0) -> str:
 def format_time(milliseconds: int) -> str:
     seconds = max(0, milliseconds // 1000)
     return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def is_audio_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+
+
+class SampleLibrary:
+    def __init__(self, app_dir: Path) -> None:
+        self.root = app_dir / "samples"
+        self.imported_dir = self.root / "imported"
+        self.trimmed_dir = self.root / "trimmed"
+        self.metadata_path = self.root / "library.json"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.imported_dir.mkdir(exist_ok=True)
+        self.trimmed_dir.mkdir(exist_ok=True)
+        self.data: dict[str, object] = {
+            "entries": {},
+            "last_directory": str(Path.home()),
+            "scan_recursive": False,
+        }
+        self._load()
+
+    @property
+    def entries(self) -> dict[str, dict[str, str]]:
+        entries = self.data.get("entries", {})
+        return entries if isinstance(entries, dict) else {}
+
+    @property
+    def last_directory(self) -> Path:
+        value = self.data.get("last_directory")
+        path = Path(value) if isinstance(value, str) else Path.home()
+        return path if path.is_dir() else Path.home()
+
+    @property
+    def scan_recursive(self) -> bool:
+        return bool(self.data.get("scan_recursive", False))
+
+    def _load(self) -> None:
+        try:
+            loaded = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                self.data.update(loaded)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def save(self) -> None:
+        temporary = self.metadata_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(self.data, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(self.metadata_path)
+
+    def set_last_directory(self, path: Path) -> None:
+        if path.is_dir():
+            self.data["last_directory"] = str(path.resolve())
+            self.save()
+
+    def set_scan_recursive(self, enabled: bool) -> None:
+        self.data["scan_recursive"] = enabled
+        self.save()
+
+    def _record(self, path: Path, kind: str, source: Path | None = None) -> None:
+        resolved = path.resolve()
+        self.entries[str(resolved)] = {
+            "path": str(resolved),
+            "name": resolved.name,
+            "kind": kind,
+            "source": str(source.resolve()) if source else "",
+        }
+
+    def add_references(self, paths: list[Path]) -> int:
+        count = 0
+        for path in paths:
+            if is_audio_file(path):
+                key = str(path.resolve())
+                if key not in self.entries:
+                    count += 1
+                self._record(path, "reference")
+        self.save()
+        return count
+
+    def _unique_destination(self, directory: Path, name: str) -> Path:
+        candidate = directory / name
+        stem = candidate.stem
+        suffix = candidate.suffix
+        index = 2
+        while candidate.exists():
+            candidate = directory / f"{stem} ({index}){suffix}"
+            index += 1
+        return candidate
+
+    def copy_into_library(self, paths: list[Path]) -> list[Path]:
+        copied: list[Path] = []
+        for source in paths:
+            if not is_audio_file(source):
+                continue
+            destination = self._unique_destination(self.imported_dir, source.name)
+            shutil.copy2(source, destination)
+            self._record(destination, "managed", source)
+            copied.append(destination)
+        self.save()
+        return copied
+
+    def add_trimmed(self, path: Path) -> None:
+        self._record(path, "managed")
+        self.save()
+
+    def scan_folder(self, folder: Path, recursive: bool) -> list[Path]:
+        paths = folder.rglob("*") if recursive else folder.iterdir()
+        return sorted((path for path in paths if is_audio_file(path)), key=lambda path: path.name.casefold())
+
+    def library_files(self) -> list[Path]:
+        paths: list[Path] = []
+        for record in self.entries.values():
+            if not isinstance(record, dict):
+                continue
+            path = Path(record.get("path", ""))
+            if is_audio_file(path):
+                paths.append(path)
+        return sorted(set(paths), key=lambda path: path.name.casefold())
+
+    def reference_files(self) -> list[Path]:
+        paths: list[Path] = []
+        for record in self.entries.values():
+            if not isinstance(record, dict) or record.get("kind") != "reference":
+                continue
+            path = Path(record.get("path", ""))
+            if path.suffix.lower() in SUPPORTED_SUFFIXES:
+                paths.append(path)
+        return sorted(set(paths), key=lambda path: path.name.casefold())
 
 
 class SplitThread(QThread):
@@ -241,25 +386,38 @@ class StemCard(QGroupBox):
 
         buttons = QHBoxLayout()
         self.play_button = self._icon_button("Play", QStyle.StandardPixmap.SP_MediaPlay)
-        self.play_button.clicked.connect(self._toggle_play_pause)
+        self.play_button.setIcon(bundled_icon("play.svg"))
+        self.play_button.clicked.connect(self._play)
+        self.pause_button = self._icon_button("Pause", QStyle.StandardPixmap.SP_MediaPause)
+        self.pause_button.setIcon(bundled_icon("pause.svg"))
+        self.pause_button.clicked.connect(self._pause)
         self.stop_button = self._icon_button("Stop", QStyle.StandardPixmap.SP_MediaStop)
+        self.stop_button.setIcon(bundled_icon("stop.svg"))
         self.stop_button.clicked.connect(self._stop)
         self.rewind_start_button = self._icon_button(
-            "Rewind to beginning", QStyle.StandardPixmap.SP_MediaSeekBackward
+            "Skip to beginning", QStyle.StandardPixmap.SP_MediaSeekBackward
         )
+        self.rewind_start_button.setIcon(bundled_icon("skip-start.svg"))
         self.rewind_start_button.clicked.connect(self._rewind_to_start)
         self.rewind_button = self._icon_button("Rewind 5 seconds", QStyle.StandardPixmap.SP_MediaSkipBackward)
+        self.rewind_button.setIcon(bundled_icon("rewind.svg"))
         self.rewind_button.clicked.connect(lambda: self._seek_relative(-5000))
         self.forward_button = self._icon_button("Fast-forward 5 seconds", QStyle.StandardPixmap.SP_MediaSkipForward)
+        self.forward_button.setIcon(bundled_icon("fast-forward.svg"))
         self.forward_button.clicked.connect(lambda: self._seek_relative(5000))
+        self.skip_end_button = self._icon_button("Skip to end", QStyle.StandardPixmap.SP_MediaSeekForward)
+        self.skip_end_button.setIcon(bundled_icon("skip-end.svg"))
+        self.skip_end_button.clicked.connect(self._skip_to_end)
         self.export_button = QPushButton("Save WAV")
         self.export_button.clicked.connect(lambda: self.export_requested.emit(self))
         for button in (
-            self.play_button,
-            self.stop_button,
             self.rewind_start_button,
             self.rewind_button,
+            self.play_button,
             self.forward_button,
+            self.skip_end_button,
+            self.stop_button,
+            self.pause_button,
         ):
             buttons.addWidget(button)
         buttons.addStretch()
@@ -270,6 +428,7 @@ class StemCard(QGroupBox):
     def _icon_button(self, name: str, standard_icon: QStyle.StandardPixmap) -> QPushButton:
         button = QPushButton()
         button.setFixedSize(30, 30)
+        button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         button.setIcon(self.style().standardIcon(standard_icon))
         button.setIconSize(QSize(18, 18))
         button.setToolTip(name)
@@ -279,10 +438,12 @@ class StemCard(QGroupBox):
     def _set_controls_enabled(self, enabled: bool) -> None:
         for button in (
             self.play_button,
-            self.stop_button,
             self.rewind_start_button,
             self.rewind_button,
+            self.pause_button,
+            self.stop_button,
             self.forward_button,
+            self.skip_end_button,
             self.export_button,
         ):
             button.setEnabled(enabled)
@@ -317,13 +478,13 @@ class StemCard(QGroupBox):
         self.set_file(None)
         self.status.setText("Waiting for a split")
 
-    def _toggle_play_pause(self) -> None:
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-        else:
-            if self.player.position() >= self.player.duration() > 0:
-                self.player.setPosition(0)
-            self.player.play()
+    def _play(self) -> None:
+        if self.player.position() >= self.player.duration() > 0:
+            self.player.setPosition(0)
+        self.player.play()
+
+    def _pause(self) -> None:
+        self.player.pause()
 
     def _stop(self) -> None:
         self.player.stop()
@@ -331,6 +492,9 @@ class StemCard(QGroupBox):
 
     def _rewind_to_start(self) -> None:
         self.player.setPosition(0)
+
+    def _skip_to_end(self) -> None:
+        self.player.setPosition(self.player.duration())
 
     def _seek_relative(self, milliseconds: int) -> None:
         position = max(0, min(self.player.duration(), self.player.position() + milliseconds))
@@ -348,11 +512,8 @@ class StemCard(QGroupBox):
         self.position_slider.setRange(0, max(0, duration))
         self.duration_label.setText(format_time(duration))
 
-    def _playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
-        if state == QMediaPlayer.PlaybackState.PlayingState:
-            self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
-        else:
-            self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+    def _playback_state_changed(self, _state: QMediaPlayer.PlaybackState) -> None:
+        pass
 
     def _playback_error(self, _error: QMediaPlayer.Error) -> None:
         if self.player.errorString():
@@ -362,6 +523,622 @@ class StemCard(QGroupBox):
         self.player.stop()
 
 
+class PreviewPlayer(QGroupBox):
+    playhead_changed = pyqtSignal(int, int)
+
+    def __init__(self) -> None:
+        super().__init__("")
+        self.file_path: Path | None = None
+        self.clip_start = 0
+        self.clip_end: int | None = None
+
+        self.player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio_output)
+        self.player.positionChanged.connect(self._position_changed)
+        self.player.durationChanged.connect(self._duration_changed)
+        self.player.playbackStateChanged.connect(self._playback_state_changed)
+        self.player.errorOccurred.connect(self._playback_error)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(5)
+        self.file_label = QLabel("Select an audio file")
+        layout.addWidget(self.file_label)
+
+        self.position_slider = QSlider(Qt.Orientation.Horizontal)
+        self.position_slider.setRange(0, 0)
+        self.position_slider.sliderMoved.connect(self._seek)
+        layout.addWidget(self.position_slider)
+
+        time_row = QHBoxLayout()
+        self.position_label = QLabel("0:00")
+        self.duration_label = QLabel("0:00")
+        time_row.addWidget(self.position_label)
+        time_row.addStretch()
+        time_row.addWidget(self.duration_label)
+        layout.addLayout(time_row)
+
+        controls = QHBoxLayout()
+        self.play_button = self._icon_button("Play", QStyle.StandardPixmap.SP_MediaPlay)
+        self.play_button.setIcon(bundled_icon("play.svg"))
+        self.play_button.clicked.connect(self._play)
+        self.pause_button = self._icon_button("Pause", QStyle.StandardPixmap.SP_MediaPause)
+        self.pause_button.setIcon(bundled_icon("pause.svg"))
+        self.pause_button.clicked.connect(self._pause)
+        self.stop_button = self._icon_button("Stop", QStyle.StandardPixmap.SP_MediaStop)
+        self.stop_button.setIcon(bundled_icon("stop.svg"))
+        self.stop_button.clicked.connect(self._stop)
+        self.rewind_start_button = self._icon_button(
+            "Skip to beginning", QStyle.StandardPixmap.SP_MediaSeekBackward
+        )
+        self.rewind_start_button.setIcon(bundled_icon("skip-start.svg"))
+        self.rewind_start_button.clicked.connect(self._rewind_to_start)
+        self.rewind_button = self._icon_button("Rewind 5 seconds", QStyle.StandardPixmap.SP_MediaSkipBackward)
+        self.rewind_button.setIcon(bundled_icon("rewind.svg"))
+        self.rewind_button.clicked.connect(lambda: self._seek_relative(-5000))
+        self.forward_button = self._icon_button("Fast-forward 5 seconds", QStyle.StandardPixmap.SP_MediaSkipForward)
+        self.forward_button.setIcon(bundled_icon("fast-forward.svg"))
+        self.forward_button.clicked.connect(lambda: self._seek_relative(5000))
+        self.skip_end_button = self._icon_button("Skip to end", QStyle.StandardPixmap.SP_MediaSeekForward)
+        self.skip_end_button.setIcon(bundled_icon("skip-end.svg"))
+        self.skip_end_button.clicked.connect(self._skip_to_end)
+        for button in (
+            self.rewind_start_button,
+            self.rewind_button,
+            self.play_button,
+            self.forward_button,
+            self.skip_end_button,
+            self.stop_button,
+            self.pause_button,
+        ):
+            controls.addWidget(button)
+        controls.addStretch()
+        layout.addLayout(controls)
+        self._set_controls_enabled(False)
+
+    def _icon_button(self, name: str, standard_icon: QStyle.StandardPixmap) -> QPushButton:
+        button = QPushButton()
+        button.setFixedSize(30, 30)
+        button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        button.setIcon(self.style().standardIcon(standard_icon))
+        button.setIconSize(QSize(18, 18))
+        button.setToolTip(name)
+        button.setAccessibleName(name)
+        return button
+
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        for button in (
+            self.play_button,
+            self.rewind_start_button,
+            self.rewind_button,
+            self.pause_button,
+            self.stop_button,
+            self.forward_button,
+            self.skip_end_button,
+        ):
+            button.setEnabled(enabled)
+        self.position_slider.setEnabled(enabled)
+
+    def set_file(self, path: Path | None) -> None:
+        self.player.stop()
+        self.file_path = path if path and path.exists() else None
+        self.clip_start = 0
+        self.clip_end = None
+        self.position_slider.setRange(0, 0)
+        self.position_label.setText("0:00")
+        self.duration_label.setText("0:00")
+        if self.file_path:
+            self.file_label.setText(self.file_path.name)
+            self.player.setSource(QUrl.fromLocalFile(str(self.file_path)))
+        else:
+            self.file_label.setText("Select an audio file")
+            self.player.setSource(QUrl())
+        self.playhead_changed.emit(0, 0)
+        self._set_controls_enabled(self.file_path is not None)
+
+    def set_clip(self, start_ms: int, end_ms: int | None) -> None:
+        self.clip_start = max(0, start_ms)
+        self.clip_end = end_ms if end_ms and end_ms > self.clip_start else None
+
+    def _play(self) -> None:
+        if not self.file_path:
+            return
+        if self.player.position() >= (self.clip_end or self.player.duration()):
+            self.player.setPosition(self.clip_start)
+        self.player.play()
+
+    def _pause(self) -> None:
+        self.player.pause()
+
+    def play_selection(self, start_ms: int, end_ms: int | None) -> None:
+        self.set_clip(start_ms, end_ms)
+        self.player.setPosition(self.clip_start)
+        self.player.play()
+
+    def _stop(self) -> None:
+        self.player.stop()
+        self.player.setPosition(self.clip_start)
+
+    def _rewind_to_start(self) -> None:
+        self.player.setPosition(self.clip_start)
+
+    def _skip_to_end(self) -> None:
+        self.player.setPosition(self.clip_end or self.player.duration())
+
+    def _seek_relative(self, milliseconds: int) -> None:
+        end = self.clip_end or self.player.duration()
+        self.player.setPosition(max(self.clip_start, min(end, self.player.position() + milliseconds)))
+
+    def _seek(self, position: int) -> None:
+        end = self.clip_end or self.player.duration()
+        self.player.setPosition(max(self.clip_start, min(end, position)))
+
+    def _position_changed(self, position: int) -> None:
+        if self.clip_end and position >= self.clip_end:
+            self.player.pause()
+            self.player.setPosition(self.clip_start)
+            position = self.clip_start
+        if not self.position_slider.isSliderDown():
+            self.position_slider.setValue(position)
+        self.position_label.setText(format_time(position))
+        self.playhead_changed.emit(position, self.player.duration())
+
+    def _duration_changed(self, duration: int) -> None:
+        self.position_slider.setRange(0, max(0, duration))
+        self.duration_label.setText(format_time(duration))
+
+    def _playback_state_changed(self, _state: QMediaPlayer.PlaybackState) -> None:
+        pass
+
+    def _playback_error(self, _error: QMediaPlayer.Error) -> None:
+        if self.player.errorString():
+            self.file_label.setText(f"Playback error: {self.player.errorString()}")
+
+    def close_player(self) -> None:
+        self.player.stop()
+
+
+class WaveformDecodeThread(QThread):
+    loaded = pyqtSignal(object, int)
+    failed = pyqtSignal(str)
+
+    def __init__(self, path: Path) -> None:
+        super().__init__()
+        self.path = path
+
+    def run(self) -> None:
+        command = [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(self.path),
+            "-f",
+            "f32le",
+            "-ar",
+            "44100",
+            "-ac",
+            "1",
+            "-",
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, check=False)
+        except OSError as exc:
+            self.failed.emit(f"Could not run FFmpeg: {exc}")
+            return
+        if result.returncode != 0:
+            details = result.stderr.decode("utf-8", errors="replace").strip()
+            self.failed.emit(details or "FFmpeg could not decode this file.")
+            return
+        samples = np.frombuffer(result.stdout, dtype=np.float32).copy()
+        if not samples.size:
+            self.failed.emit("This file contains no decodable audio.")
+            return
+        self.loaded.emit(samples, 44100)
+
+
+class WaveformWidget(QWidget):
+    range_changed = pyqtSignal(int, int)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumHeight(120)
+        self.samples = np.array([], dtype=np.float32)
+        self.sample_rate = 44100
+        self.start_ratio = 0.0
+        self.end_ratio = 1.0
+        self.view_start_ratio = 0.0
+        self.view_end_ratio = 1.0
+        self.playhead_ratio: float | None = None
+        self.dragging: str | None = None
+
+    def set_samples(self, samples: np.ndarray, sample_rate: int) -> None:
+        self.samples = samples
+        self.sample_rate = sample_rate
+        self.start_ratio = 0.0
+        self.end_ratio = 1.0
+        self.view_start_ratio = 0.0
+        self.view_end_ratio = 1.0
+        self.playhead_ratio = None
+        self.update()
+        self._emit_range()
+
+    def set_playhead(self, position_ms: int, duration_ms: int) -> None:
+        if not self.samples.size or duration_ms <= 0:
+            self.playhead_ratio = None
+        else:
+            self.playhead_ratio = max(0.0, min(1.0, position_ms / duration_ms))
+        self.update()
+
+    def zoom_to_selection(self) -> None:
+        if not self.samples.size or self.end_ratio - self.start_ratio <= 0.001:
+            return
+        self.view_start_ratio = self.start_ratio
+        self.view_end_ratio = self.end_ratio
+        self.update()
+
+    def reset_zoom(self) -> None:
+        self.view_start_ratio = 0.0
+        self.view_end_ratio = 1.0
+        self.update()
+
+    def range_samples(self) -> tuple[int, int]:
+        if not self.samples.size:
+            return 0, 0
+        return round(self.start_ratio * len(self.samples)), round(self.end_ratio * len(self.samples))
+
+    def _emit_range(self) -> None:
+        start, end = self.range_samples()
+        self.range_changed.emit(start, end)
+
+    def _ratio_for_x(self, x: float) -> float:
+        visible_ratio = max(0.001, self.view_end_ratio - self.view_start_ratio)
+        local_ratio = max(0.0, min(1.0, x / max(1, self.width())))
+        return self.view_start_ratio + local_ratio * visible_ratio
+
+    def _set_handle(self, handle: str, ratio: float) -> None:
+        if handle == "start":
+            self.start_ratio = min(ratio, self.end_ratio - 0.001)
+        else:
+            self.end_ratio = max(ratio, self.start_ratio + 0.001)
+        self.update()
+        self._emit_range()
+
+    def mousePressEvent(self, event) -> None:
+        if not self.samples.size:
+            return
+        ratio = self._ratio_for_x(event.position().x())
+        start_distance = abs(ratio - self.start_ratio)
+        end_distance = abs(ratio - self.end_ratio)
+        self.dragging = "start" if start_distance <= end_distance else "end"
+        self._set_handle(self.dragging, ratio)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.dragging:
+            self._set_handle(self.dragging, self._ratio_for_x(event.position().x()))
+
+    def mouseReleaseEvent(self, _event) -> None:
+        self.dragging = None
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), self.palette().base())
+        if not self.samples.size:
+            painter.setPen(self.palette().text().color())
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Select an audio file to load its waveform")
+            return
+
+        width = max(1, self.width())
+        height = self.height()
+        view_ratio = max(0.001, self.view_end_ratio - self.view_start_ratio)
+        selected_left = round((self.start_ratio - self.view_start_ratio) / view_ratio * width)
+        selected_right = round((self.end_ratio - self.view_start_ratio) / view_ratio * width)
+        selected_left = max(0, min(width, selected_left))
+        selected_right = max(0, min(width, selected_right))
+        painter.fillRect(selected_left, 0, selected_right - selected_left, height, QColor(220, 235, 250))
+        view_start = round(self.view_start_ratio * len(self.samples))
+        view_end = max(view_start + 1, round(self.view_end_ratio * len(self.samples)))
+        view_length = view_end - view_start
+        bin_size = max(1, view_length // width)
+        pen = QPen(self.palette().highlight().color())
+        painter.setPen(pen)
+        center = height // 2
+        for x in range(width):
+            start = min(view_end, view_start + x * bin_size)
+            end = min(len(self.samples), start + bin_size)
+            if start >= end:
+                break
+            peak = float(np.max(np.abs(self.samples[start:end])))
+            half_height = max(1, round(peak * (height // 2 - 4)))
+            painter.drawLine(x, center - half_height, x, center + half_height)
+        handle_pen = QPen(self.palette().text().color(), 2)
+        painter.setPen(handle_pen)
+        painter.drawLine(selected_left, 0, selected_left, height)
+        painter.drawLine(selected_right, 0, selected_right, height)
+        if self.playhead_ratio is not None and self.view_start_ratio <= self.playhead_ratio <= self.view_end_ratio:
+            playhead_x = round(
+                (self.playhead_ratio - self.view_start_ratio) / view_ratio * width
+            )
+            painter.setPen(QPen(self.palette().link().color(), 2))
+            painter.drawLine(playhead_x, 0, playhead_x, height)
+
+
+class WaveformEditor(QGroupBox):
+    saved = pyqtSignal(object)
+    working_file_changed = pyqtSignal(object)
+
+    def __init__(self) -> None:
+        super().__init__("")
+        self.file_path: Path | None = None
+        self.samples = np.array([], dtype=np.float32)
+        self.sample_rate = 44100
+        self.decode_thread: WaveformDecodeThread | None = None
+        self.load_serial = 0
+        self.working_name = ""
+        self.undo_state: tuple[np.ndarray, int, str] | None = None
+        self.preview_dir = Path(tempfile.mkdtemp(prefix="sample-preview-"))
+
+        layout = QVBoxLayout(self)
+        self.file_label = QLabel()
+        self.file_label.setVisible(False)
+        layout.addWidget(self.file_label)
+        self.waveform = WaveformWidget()
+        self.waveform.setMinimumHeight(120)
+        self.waveform.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.waveform.range_changed.connect(self._range_changed)
+        layout.addWidget(self.waveform)
+        controls = QHBoxLayout()
+        controls.setSpacing(3)
+        controls.setContentsMargins(0, 0, 0, 0)
+        self.range_label = QLabel("Full file")
+        self.range_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        controls.addWidget(self.range_label)
+        controls.addStretch()
+        self.play_button = self._icon_button("Play", QStyle.StandardPixmap.SP_MediaPlay)
+        self.play_button.setIcon(self._editor_icon("play"))
+        self.preview_button = self.play_button
+        self.pause_button = self._icon_button("Pause", QStyle.StandardPixmap.SP_MediaPause)
+        self.pause_button.setIcon(self._editor_icon("pause"))
+        self.stop_button = self._icon_button("Stop", QStyle.StandardPixmap.SP_MediaStop)
+        self.stop_button.setIcon(self._editor_icon("stop"))
+        self.rewind_start_button = self._icon_button(
+            "Skip to beginning", QStyle.StandardPixmap.SP_MediaSeekBackward
+        )
+        self.rewind_start_button.setIcon(self._editor_icon("skip-start"))
+        self.rewind_button = self._icon_button("Rewind 5 seconds", QStyle.StandardPixmap.SP_MediaSkipBackward)
+        self.rewind_button.setIcon(self._editor_icon("rewind"))
+        self.forward_button = self._icon_button("Fast-forward 5 seconds", QStyle.StandardPixmap.SP_MediaSkipForward)
+        self.forward_button.setIcon(self._editor_icon("fast-forward"))
+        self.skip_end_button = self._icon_button("Skip to end", QStyle.StandardPixmap.SP_MediaSeekForward)
+        self.skip_end_button.setIcon(self._editor_icon("skip-end"))
+        controls.addWidget(self.rewind_start_button)
+        controls.addWidget(self.rewind_button)
+        controls.addWidget(self.play_button)
+        controls.addWidget(self.forward_button)
+        controls.addWidget(self.skip_end_button)
+        controls.addWidget(self.stop_button)
+        controls.addWidget(self.pause_button)
+        self.zoom_button = self._icon_button("Zoom to selection", QStyle.StandardPixmap.SP_ArrowUp)
+        self.zoom_button.setIcon(self._editor_icon("zoom-in"))
+        self.zoom_button.clicked.connect(self.waveform.zoom_to_selection)
+        controls.addWidget(self.zoom_button)
+        self.reset_zoom_button = self._icon_button("Reset zoom", QStyle.StandardPixmap.SP_ArrowDown)
+        self.reset_zoom_button.setIcon(self._editor_icon("zoom-out"))
+        self.reset_zoom_button.clicked.connect(self.waveform.reset_zoom)
+        controls.addWidget(self.reset_zoom_button)
+        self.undo_button = self._icon_button("Undo trim", QStyle.StandardPixmap.SP_ArrowBack)
+        self.undo_button.setIcon(self._editor_icon("undo"))
+        self.undo_button.clicked.connect(self._undo_trim)
+        controls.addWidget(self.undo_button)
+        self.apply_trim_button = self._icon_button("Apply trim", QStyle.StandardPixmap.SP_DialogApplyButton)
+        self.apply_trim_button.setIcon(self._editor_icon("scissors"))
+        self.apply_trim_button.clicked.connect(self._apply_trim)
+        controls.addWidget(self.apply_trim_button)
+        self.save_button = self._icon_button("Save trimmed WAV", QStyle.StandardPixmap.SP_DialogSaveButton)
+        self.save_button.setIcon(self._editor_icon("floppy"))
+        self.save_button.clicked.connect(self.save_trimmed)
+        controls.addWidget(self.save_button)
+        layout.addLayout(controls)
+        layout.setStretch(1, 1)
+        self.preview_range_requested = None
+        self._set_action_state(False)
+
+    def _icon_button(self, name: str, standard_icon: QStyle.StandardPixmap) -> QPushButton:
+        button = QPushButton()
+        button.setFixedSize(30, 30)
+        button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        button.setIcon(self.style().standardIcon(standard_icon))
+        button.setIconSize(QSize(18, 18))
+        button.setToolTip(name)
+        button.setAccessibleName(name)
+        return button
+
+    def _editor_icon(self, kind: str) -> QIcon:
+        icon_files = {
+            "play": "play.svg",
+            "pause": "pause.svg",
+            "stop": "stop.svg",
+            "scissors": "edit-cut.svg",
+            "rewind": "rewind.svg",
+            "fast-forward": "fast-forward.svg",
+            "skip-start": "skip-start.svg",
+            "skip-end": "skip-end.svg",
+            "undo": "undo.svg",
+            "zoom-in": "zoom-in.svg",
+            "zoom-out": "zoom-out.svg",
+        }
+        if kind in icon_files:
+            icon = QIcon(str(Path(__file__).resolve().parent / "icons" / icon_files[kind]))
+            if not icon.isNull():
+                return icon
+            return self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
+
+        pixmap = QPixmap(24, 24)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self.palette().buttonText().color(), 2))
+        painter.drawRoundedRect(3, 3, 18, 18, 2, 2)
+        painter.drawRect(7, 3, 8, 6)
+        painter.drawRect(7, 15, 10, 6)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _set_action_state(self, enabled: bool) -> None:
+        for button in (
+            self.play_button,
+            self.pause_button,
+            self.stop_button,
+            self.rewind_start_button,
+            self.rewind_button,
+            self.forward_button,
+            self.skip_end_button,
+            self.zoom_button,
+            self.reset_zoom_button,
+            self.apply_trim_button,
+            self.save_button,
+        ):
+            button.setEnabled(enabled)
+        self.undo_button.setEnabled(enabled and self.undo_state is not None)
+
+    def set_playhead(self, position_ms: int, duration_ms: int) -> None:
+        self.waveform.set_playhead(position_ms, duration_ms)
+
+    def set_preview_callback(self, callback) -> None:
+        self.preview_range_requested = callback
+
+    def set_file(self, path: Path | None) -> None:
+        self.load_serial += 1
+        load_serial = self.load_serial
+        if self.decode_thread and self.decode_thread.isRunning():
+            self.decode_thread.terminate()
+            self.decode_thread.wait(1000)
+        self.file_path = path if path and path.exists() else None
+        self.samples = np.array([], dtype=np.float32)
+        self.working_name = self.file_path.name if self.file_path else ""
+        self.undo_state = None
+        self.waveform.set_samples(self.samples, self.sample_rate)
+        self._set_action_state(False)
+        if not self.file_path:
+            self.file_label.clear()
+            self.file_label.setVisible(False)
+            return
+        self.file_label.setVisible(True)
+        self.file_label.setText(f"Loading {self.file_path.name}...")
+        self.decode_thread = WaveformDecodeThread(self.file_path)
+        self.decode_thread.loaded.connect(
+            lambda samples, sample_rate: self._loaded_if_current(load_serial, samples, sample_rate)
+        )
+        self.decode_thread.failed.connect(lambda message: self._failed_if_current(load_serial, message))
+        self.decode_thread.start()
+
+    def _loaded_if_current(self, load_serial: int, samples: np.ndarray, sample_rate: int) -> None:
+        if load_serial != self.load_serial:
+            return
+        self.samples = samples
+        self.sample_rate = sample_rate
+        self.waveform.set_samples(samples, sample_rate)
+        self.file_label.setText(self.working_name)
+        self._set_action_state(True)
+
+    def _failed_if_current(self, load_serial: int, message: str) -> None:
+        if load_serial != self.load_serial:
+            return
+        self.file_label.setText(f"Waveform unavailable: {message}")
+
+    def _range_changed(self, start: int, end: int) -> None:
+        if not self.samples.size:
+            self.range_label.setText("Full file")
+            self._set_action_state(False)
+            return
+        start_ms = round(start / self.sample_rate * 1000)
+        end_ms = round(end / self.sample_rate * 1000)
+        self.range_label.setText(f"{format_time(start_ms)} - {format_time(end_ms)}")
+        self._set_action_state(True)
+        self.zoom_button.setEnabled(self.waveform.end_ratio - self.waveform.start_ratio < 0.999)
+        self.reset_zoom_button.setEnabled(
+            self.waveform.view_start_ratio > 0.001 or self.waveform.view_end_ratio < 0.999
+        )
+
+    def _selected_range_ms(self) -> tuple[int, int]:
+        start, end = self.waveform.range_samples()
+        return round(start / self.sample_rate * 1000), round(end / self.sample_rate * 1000)
+
+    def _preview_selection(self) -> None:
+        if self.preview_range_requested and self.samples.size:
+            self.preview_range_requested(*self._selected_range_ms())
+
+    def _write_working_preview(self) -> Path:
+        destination = self.preview_dir / "untitled.wav"
+        pcm = np.clip(self.samples, -1.0, 1.0)
+        with wave.open(str(destination), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(self.sample_rate)
+            output.writeframes((pcm * 32767).astype(np.int16).tobytes())
+        return destination
+
+    def _emit_working_preview(self) -> None:
+        if self.working_name != "untitled.wav" and self.file_path:
+            self.working_file_changed.emit(self.file_path)
+        else:
+            self.working_file_changed.emit(self._write_working_preview())
+
+    def _apply_trim(self) -> None:
+        if not self.samples.size:
+            return
+        start, end = self.waveform.range_samples()
+        if end <= start:
+            return
+        self.undo_state = (self.samples.copy(), self.sample_rate, self.working_name)
+        self.samples = self.samples[start:end].copy()
+        self.working_name = "untitled.wav"
+        self.waveform.set_samples(self.samples, self.sample_rate)
+        self.file_label.setText(self.working_name)
+        self._emit_working_preview()
+        self._set_action_state(True)
+        self.undo_button.setEnabled(True)
+
+    def _undo_trim(self) -> None:
+        if not self.undo_state:
+            return
+        self.samples, self.sample_rate, self.working_name = self.undo_state
+        self.undo_state = None
+        self.waveform.set_samples(self.samples, self.sample_rate)
+        self.file_label.setText(self.working_name)
+        self._emit_working_preview()
+        self._set_action_state(True)
+
+    def save_trimmed(self) -> None:
+        if not self.file_path or not self.samples.size:
+            return
+        default_name = self.working_name if self.working_name == "untitled.wav" else f"{self.file_path.stem}-trimmed.wav"
+        default = Path(__file__).resolve().parent / "samples" / "trimmed" / default_name
+        destination, _ = QFileDialog.getSaveFileName(self, "Save trimmed sample", str(default), "WAV files (*.wav)")
+        if not destination:
+            return
+        start, end = self.waveform.range_samples()
+        rendered = np.clip(self.samples[start:end], -1.0, 1.0)
+        pcm = (rendered * 32767).astype(np.int16).tobytes()
+        try:
+            with wave.open(destination, "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(self.sample_rate)
+                output.writeframes(pcm)
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not save sample", str(exc))
+            return
+        self.saved.emit(Path(destination))
+
+    def close_editor(self) -> None:
+        if self.decode_thread and self.decode_thread.isRunning():
+            self.decode_thread.terminate()
+            self.decode_thread.wait(1000)
+        shutil.rmtree(self.preview_dir, ignore_errors=True)
+
+
 class AudioSplitter(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -369,31 +1146,33 @@ class AudioSplitter(QMainWindow):
         self.split_thread: SplitThread | None = None
         self.temp_root = Path(tempfile.mkdtemp(prefix="audio-splitter-"))
         self.cards: dict[str, StemCard] = {}
+        self.sample_library = SampleLibrary(Path(__file__).resolve().parent)
+        self.current_samples_directory: Path | None = None
+        self.last_explorer_directory = self.sample_library.last_directory
+        self.showing_library = False
 
         self.setWindowTitle("Stem Splitter")
         self.setFixedSize(1120, 760)
         self.setAcceptDrops(True)
 
         self._build_ui()
+        self.statusBar().setVisible(False)
 
     def _build_ui(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
         page = QVBoxLayout(root)
-        page.setContentsMargins(18, 18, 18, 18)
+        page.setContentsMargins(6, 6, 6, 6)
         page.setSpacing(10)
 
-        heading = QHBoxLayout()
-        title_column = QVBoxLayout()
-        title = QLabel("Stem Splitter")
-        title_font = QFont(title.font())
-        title_font.setPointSize(18)
-        title_font.setBold(True)
-        title.setFont(title_font)
-        title_column.addWidget(title)
-        heading.addLayout(title_column)
-        heading.addStretch()
-        page.addLayout(heading)
+        tabs = QTabWidget()
+        tabs.addTab(self._build_samples_page(), "Samples")
+        splitter_page = QWidget()
+        splitter_layout = QVBoxLayout(splitter_page)
+        splitter_layout.setContentsMargins(8, 8, 8, 8)
+        splitter_layout.setSpacing(10)
+        tabs.addTab(splitter_page, "Stem Splitter")
+        page.addWidget(tabs)
 
         source = QGroupBox("Source track")
         source_layout = QHBoxLayout(source)
@@ -406,13 +1185,13 @@ class AudioSplitter(QMainWindow):
         self.choose_button = QPushButton("Choose track...")
         self.choose_button.clicked.connect(self.choose_track)
         source_layout.addWidget(self.choose_button)
-        page.addWidget(source)
+        splitter_layout.addWidget(source)
 
         self.split_button = QPushButton("Split track")
         self.split_button.setMinimumHeight(36)
         self.split_button.setEnabled(False)
         self.split_button.clicked.connect(self.split_track)
-        page.addWidget(self.split_button)
+        splitter_layout.addWidget(self.split_button)
 
         self.progress_panel = QWidget()
         progress_layout = QVBoxLayout(self.progress_panel)
@@ -426,12 +1205,7 @@ class AudioSplitter(QMainWindow):
         progress_layout.addWidget(self.progress_bar)
         progress_layout.addWidget(self.progress_label)
         self.progress_panel.setVisible(False)
-        page.addWidget(self.progress_panel)
-
-        stem_header = QHBoxLayout()
-        stem_title = QLabel("Stems")
-        stem_header.addWidget(stem_title)
-        page.addLayout(stem_header)
+        splitter_layout.addWidget(self.progress_panel)
 
         stem_grid = QGridLayout()
         stem_grid.setHorizontalSpacing(10)
@@ -442,7 +1216,7 @@ class AudioSplitter(QMainWindow):
             card.export_requested.connect(self.export_card)
             self.cards[stem] = card
             stem_grid.addWidget(card, index // 2, index % 2)
-        page.addLayout(stem_grid)
+        splitter_layout.addLayout(stem_grid)
 
         export_panel = QGroupBox("Export WAV files")
         export_layout = QHBoxLayout(export_panel)
@@ -459,7 +1233,307 @@ class AudioSplitter(QMainWindow):
         self.folder_export_button.clicked.connect(self.export_existing_folder)
         export_layout.addWidget(self.named_export_button)
         export_layout.addWidget(self.folder_export_button)
-        page.addWidget(export_panel)
+        splitter_layout.addWidget(export_panel)
+
+    def _build_samples_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(8)
+
+        view_switch = QHBoxLayout()
+        self.explorer_view_button = QPushButton("Explorer")
+        self.library_view_button = QPushButton("Library")
+        for button in (self.explorer_view_button, self.library_view_button):
+            button.setCheckable(True)
+        self.explorer_view_button.setChecked(True)
+        view_group = QButtonGroup(self)
+        view_group.setExclusive(True)
+        view_group.addButton(self.explorer_view_button)
+        view_group.addButton(self.library_view_button)
+        self.explorer_view_button.clicked.connect(lambda: self._set_sample_view("explorer"))
+        self.library_view_button.clicked.connect(lambda: self._set_sample_view("library"))
+        view_switch.addWidget(self.explorer_view_button)
+        view_switch.addWidget(self.library_view_button)
+        view_switch.addStretch()
+        view_switch.setContentsMargins(8, 8, 0, 0)
+        layout.addLayout(view_switch)
+
+        browser = QSplitter(Qt.Orientation.Horizontal)
+        browser.setChildrenCollapsible(False)
+
+        folders = QGroupBox("")
+        folders_layout = QVBoxLayout(folders)
+        folders_layout.setContentsMargins(0, 0, 0, 0)
+        self.folder_model = QFileSystemModel(self)
+        self.folder_model.setFilter(QDir.Filter.AllDirs | QDir.Filter.NoDotAndDotDot)
+        self.filesystem_root = Path.home().anchor or "/"
+        root_index = self.folder_model.setRootPath(self.filesystem_root)
+        self.folder_tree = QTreeView()
+        self.folder_tree.setModel(self.folder_model)
+        self.folder_tree.setRootIndex(root_index)
+        self.folder_tree.setFrameShape(QFrame.Shape.NoFrame)
+        self.folder_tree.setHeaderHidden(True)
+        self.folder_tree.setColumnHidden(1, True)
+        self.folder_tree.setColumnHidden(2, True)
+        self.folder_tree.setColumnHidden(3, True)
+        self.folder_tree.selectionModel().currentChanged.connect(self._folder_changed)
+        folders_layout.addWidget(self.folder_tree)
+
+        self.library_tree = QTreeWidget()
+        self.library_tree.setHeaderHidden(True)
+        self.library_tree.setFrameShape(QFrame.Shape.NoFrame)
+        self.library_tree.itemClicked.connect(self._library_tree_changed)
+        self.library_tree.setVisible(False)
+        folders_layout.addWidget(self.library_tree)
+        browser.addWidget(folders)
+
+        files = QGroupBox("")
+        files_layout = QVBoxLayout(files)
+        files_layout.setContentsMargins(0, 0, 0, 0)
+        self.samples_location_label = QLabel("Select a folder")
+        self.samples_location_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        files_layout.addWidget(self.samples_location_label)
+        self.sample_file_list = QListWidget()
+        self.sample_file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.sample_file_list.setFrameShape(QFrame.Shape.NoFrame)
+        self.sample_file_list.currentItemChanged.connect(self._sample_selection_changed)
+        self.sample_file_list.itemDoubleClicked.connect(lambda _item: self.preview_player._play())
+        files_layout.addWidget(self.sample_file_list, 1)
+
+        self.scan_recursive_checkbox = QCheckBox("Scan subfolders")
+        self.scan_recursive_checkbox.setChecked(self.sample_library.scan_recursive)
+        self.scan_recursive_checkbox.toggled.connect(self.sample_library.set_scan_recursive)
+        files_layout.addWidget(self.scan_recursive_checkbox)
+
+        self.actions_one_widget = QWidget()
+        actions_one = QHBoxLayout(self.actions_one_widget)
+        actions_one.setContentsMargins(0, 0, 0, 0)
+        self.add_reference_button = QPushButton("Link to Library")
+        self.add_reference_button.clicked.connect(self._add_selected_references)
+        self.copy_library_button = QPushButton("Copy to Library")
+        self.copy_library_button.clicked.connect(self._copy_selected_to_library)
+        actions_one.addWidget(self.add_reference_button)
+        actions_one.addWidget(self.copy_library_button)
+        self.add_folder_button = QPushButton("Link Folder to Library")
+        self.add_folder_button.clicked.connect(self._add_folder_references)
+        self.copy_folder_button = QPushButton("Copy Folder to Library")
+        self.copy_folder_button.clicked.connect(self._copy_folder_to_library)
+        actions_one.addWidget(self.add_folder_button)
+        actions_one.addWidget(self.copy_folder_button)
+        files_layout.addWidget(self.actions_one_widget)
+
+        self.actions_two_widget = self.actions_one_widget
+        self.samples_status = QLabel()
+        files_layout.addWidget(self.samples_status)
+        browser.addWidget(files)
+        browser.setStretchFactor(0, 0)
+        browser.setStretchFactor(1, 1)
+        browser.setSizes([280, 780])
+        layout.addWidget(browser, 1)
+
+        self.preview_player = PreviewPlayer()
+        self.preview_player.setFixedHeight(145)
+        layout.addWidget(self.preview_player)
+        self.waveform_editor = WaveformEditor()
+        self.waveform_editor.setFixedHeight(280)
+        self.waveform_editor.set_preview_callback(self._preview_trim_range)
+        self.waveform_editor.working_file_changed.connect(self._working_preview_changed)
+        self.waveform_editor.saved.connect(self._trim_saved)
+        self.waveform_editor.play_button.clicked.connect(self._play_trim_selection)
+        self.waveform_editor.pause_button.clicked.connect(self._pause_trim_playback)
+        self.waveform_editor.stop_button.clicked.connect(self._stop_trim_playback)
+        self.waveform_editor.rewind_start_button.clicked.connect(self._rewind_trim_start)
+        self.waveform_editor.rewind_button.clicked.connect(lambda: self._seek_trim_playback(-5000))
+        self.waveform_editor.forward_button.clicked.connect(lambda: self._seek_trim_playback(5000))
+        self.waveform_editor.skip_end_button.clicked.connect(self._skip_trim_end)
+        self.preview_player.playhead_changed.connect(self.waveform_editor.set_playhead)
+        layout.addWidget(self.waveform_editor)
+
+        last_directory = self.sample_library.last_directory
+        self._restore_samples_directory(last_directory)
+        return page
+
+    def _set_sample_view(self, view: str) -> None:
+        showing_explorer = view == "explorer"
+        self.explorer_view_button.setChecked(showing_explorer)
+        self.library_view_button.setChecked(not showing_explorer)
+        self.scan_recursive_checkbox.setVisible(showing_explorer)
+        self.actions_one_widget.setVisible(showing_explorer)
+        self.actions_two_widget.setVisible(showing_explorer)
+        self.add_reference_button.setVisible(showing_explorer)
+        self.copy_library_button.setVisible(showing_explorer)
+        self.add_folder_button.setVisible(showing_explorer)
+        self.copy_folder_button.setVisible(showing_explorer)
+        if showing_explorer:
+            self.showing_library = False
+            self.samples_location_label.setVisible(True)
+            self.folder_tree.setVisible(True)
+            self.library_tree.setVisible(False)
+            root_index = self.folder_model.setRootPath(self.filesystem_root)
+            self.folder_tree.setRootIndex(root_index)
+            self._restore_samples_directory(self.last_explorer_directory)
+            self._show_current_folder()
+        else:
+            self.showing_library = True
+            self.folder_tree.setVisible(False)
+            self.library_tree.setVisible(True)
+            self._populate_library_tree()
+            self._show_references()
+
+    def _restore_samples_directory(self, path: Path) -> None:
+        index = self.folder_model.index(str(path))
+        if index.isValid():
+            self.folder_tree.setCurrentIndex(index)
+            self.folder_tree.scrollTo(index)
+        else:
+            self._show_directory(Path.home())
+
+    def _folder_changed(self, current, _previous) -> None:
+        path = Path(self.folder_model.filePath(current))
+        if path.is_dir():
+            self._show_directory(path)
+
+    def _populate_library_tree(self) -> None:
+        self.library_tree.clear()
+        references = QTreeWidgetItem(["References"])
+        references.setData(0, Qt.ItemDataRole.UserRole, "references")
+        self.library_tree.addTopLevelItem(references)
+        for directory in (self.sample_library.imported_dir, self.sample_library.trimmed_dir):
+            item = QTreeWidgetItem([directory.name])
+            item.setData(0, Qt.ItemDataRole.UserRole, str(directory))
+            self.library_tree.addTopLevelItem(item)
+        self.library_tree.setCurrentItem(references)
+
+    def _library_tree_changed(self, item: QTreeWidgetItem, _column: int) -> None:
+        value = item.data(0, Qt.ItemDataRole.UserRole)
+        if value == "references":
+            self._show_references()
+        elif value:
+            self._show_directory(Path(value))
+
+    def _show_references(self) -> None:
+        self.current_samples_directory = None
+        self.samples_location_label.clear()
+        self.samples_location_label.setVisible(False)
+        self.sample_file_list.clear()
+        for audio_path in self.sample_library.reference_files():
+            list_item = QListWidgetItem(audio_path.name)
+            list_item.setData(Qt.ItemDataRole.UserRole, str(audio_path))
+            if not audio_path.exists():
+                list_item.setEnabled(False)
+                list_item.setToolTip("Original file is no longer available")
+            self.sample_file_list.addItem(list_item)
+        self.samples_status.setText(f"{self.sample_file_list.count()} referenced files")
+
+    def _show_directory(self, path: Path) -> None:
+        if not path.is_dir():
+            return
+        self.current_samples_directory = path
+        self.samples_location_label.setVisible(not self.showing_library)
+        if not self.showing_library:
+            self.last_explorer_directory = path
+            self.sample_library.set_last_directory(path)
+        self.samples_location_label.setText(str(path))
+        self.sample_file_list.clear()
+        for audio_path in sorted((item for item in path.iterdir() if is_audio_file(item)), key=lambda item: item.name.casefold()):
+            list_item = QListWidgetItem(audio_path.name)
+            list_item.setData(Qt.ItemDataRole.UserRole, str(audio_path))
+            self.sample_file_list.addItem(list_item)
+        self.samples_status.setText(f"{self.sample_file_list.count()} audio files")
+
+    def _show_current_folder(self) -> None:
+        self._show_directory(self.last_explorer_directory)
+
+    def _selected_sample_paths(self) -> list[Path]:
+        paths: list[Path] = []
+        for item in self.sample_file_list.selectedItems():
+            value = item.data(Qt.ItemDataRole.UserRole)
+            if value:
+                paths.append(Path(value))
+        return paths
+
+    def _sample_selection_changed(self, current, _previous) -> None:
+        if not current:
+            self.preview_player.set_file(None)
+            self.waveform_editor.set_file(None)
+            return
+        value = current.data(Qt.ItemDataRole.UserRole)
+        path = Path(value) if value else None
+        self.preview_player.set_file(path)
+        self.waveform_editor.set_file(path)
+
+    def _add_selected_references(self) -> None:
+        paths = self._selected_sample_paths()
+        count = self.sample_library.add_references(paths)
+        self.samples_status.setText(f"Added {count} reference(s)")
+
+    def _copy_selected_to_library(self) -> None:
+        paths = self._selected_sample_paths()
+        copied = self.sample_library.copy_into_library(paths)
+        self.samples_status.setText(f"Copied {len(copied)} file(s) into the library")
+        if self.showing_library:
+            self._show_library()
+
+    def _folder_audio_paths(self) -> list[Path]:
+        return self.sample_library.scan_folder(
+            self.current_samples_directory or self.sample_library.last_directory,
+            self.scan_recursive_checkbox.isChecked(),
+        )
+
+    def _add_folder_references(self) -> None:
+        paths = self._folder_audio_paths()
+        count = self.sample_library.add_references(paths)
+        self.samples_status.setText(f"Added {count} folder reference(s)")
+
+    def _copy_folder_to_library(self) -> None:
+        paths = self._folder_audio_paths()
+        copied = self.sample_library.copy_into_library(paths)
+        self.samples_status.setText(f"Copied {len(copied)} folder file(s) into the library")
+        if self.showing_library:
+            self._show_library()
+
+    def _preview_trim_range(self, start_ms: int, end_ms: int) -> None:
+        self.preview_player.play_selection(start_ms, end_ms)
+
+    def _sync_trim_playback_range(self) -> None:
+        if self.waveform_editor.samples.size:
+            start_ms, end_ms = self.waveform_editor._selected_range_ms()
+            self.preview_player.set_clip(start_ms, end_ms)
+
+    def _play_trim_selection(self) -> None:
+        self._sync_trim_playback_range()
+        self.preview_player._play()
+
+    def _pause_trim_playback(self) -> None:
+        self.preview_player._pause()
+
+    def _stop_trim_playback(self) -> None:
+        self._sync_trim_playback_range()
+        self.preview_player._stop()
+
+    def _rewind_trim_start(self) -> None:
+        self._sync_trim_playback_range()
+        self.preview_player._rewind_to_start()
+
+    def _skip_trim_end(self) -> None:
+        self._sync_trim_playback_range()
+        self.preview_player._skip_to_end()
+
+    def _seek_trim_playback(self, milliseconds: int) -> None:
+        self._sync_trim_playback_range()
+        self.preview_player._seek_relative(milliseconds)
+
+    def _working_preview_changed(self, path: Path) -> None:
+        self.preview_player.set_file(path)
+
+    def _trim_saved(self, path: Path) -> None:
+        self.sample_library.add_trimmed(path)
+        self.samples_status.setText(f"Saved {path.name}")
+        self.preview_player.set_file(path)
+        if self.showing_library:
+            self._populate_library_tree()
+            self._show_directory(self.sample_library.trimmed_dir)
 
     def choose_track(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "Choose a music track", "", SUPPORTED_AUDIO)
@@ -551,6 +1625,8 @@ class AudioSplitter(QMainWindow):
     def closeEvent(self, event) -> None:
         for card in self.cards.values():
             card.close_player()
+        self.preview_player.close_player()
+        self.waveform_editor.close_editor()
         if self.split_thread and self.split_thread.isRunning():
             self.split_thread.terminate()
             self.split_thread.wait(1500)
