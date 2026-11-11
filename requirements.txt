@@ -1,0 +1,7 @@
+# Keep the dependency set local and avoid pulling the multi-gigabyte CUDA stack.
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cpu
+PyQt6>=6.6
+demucs>=4.0.1
+numpy>=1.26,<3
+torch==2.5.1+cpu
