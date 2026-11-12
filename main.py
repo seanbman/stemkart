@@ -5,6 +5,7 @@ import os
 import json
 import selectors
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -13,13 +14,14 @@ from pathlib import Path
 
 import numpy as np
 
-from PyQt6.QtCore import QDir, QThread, QUrl, Qt, QSize, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QFile, QDir, QIODevice, QThread, QTimer, QUrl, Qt, QSize, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFileSystemModel, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QFrame,
@@ -44,16 +46,42 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PyQt6.QtMultimedia import QAudioFormat, QAudioSource, QMediaDevices, QAudioOutput, QMediaPlayer
 
 
+APP_NAME = "StemKart"
+APP_SLUG = "stemkart"
 STEMS = ("vocals", "drums", "bass", "other")
 SUPPORTED_AUDIO = "Audio files (*.mp3 *.wav *.flac *.m4a *.ogg *.aac *.opus);;All files (*)"
 SUPPORTED_SUFFIXES = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac", ".opus"}
 
 
+def resource_path(*parts: str) -> Path:
+    """Return a path to a read-only resource shipped with the application."""
+    frozen_root = getattr(sys, "_MEIPASS", None)
+    root = Path(frozen_root) if frozen_root else Path(__file__).resolve().parent
+    return root.joinpath(*parts)
+
+
+def _xdg_base(environment_name: str, fallback: str) -> Path:
+    configured = os.environ.get(environment_name)
+    return Path(configured).expanduser() if configured else Path.home() / fallback
+
+
+def app_data_dir() -> Path:
+    return _xdg_base("XDG_DATA_HOME", ".local/share") / APP_SLUG
+
+
+def app_config_dir() -> Path:
+    return _xdg_base("XDG_CONFIG_HOME", ".config") / APP_SLUG
+
+
+def app_cache_dir() -> Path:
+    return _xdg_base("XDG_CACHE_HOME", ".cache") / APP_SLUG
+
+
 def bundled_icon(name: str) -> QIcon:
-    return QIcon(str(Path(__file__).resolve().parent / "icons" / name))
+    return QIcon(str(resource_path("icons", name)))
 
 
 def pretty_name(value: str) -> str:
@@ -146,20 +174,65 @@ def is_audio_file(path: Path) -> bool:
 
 
 class SampleLibrary:
-    def __init__(self, app_dir: Path) -> None:
-        self.root = app_dir / "samples"
+    def __init__(self, legacy_app_dir: Path | None = None) -> None:
+        self.root = app_data_dir() / "samples"
+        self.legacy_root = (legacy_app_dir or Path(__file__).resolve().parent) / "samples"
+        self._migrate_legacy_library()
         self.imported_dir = self.root / "imported"
         self.trimmed_dir = self.root / "trimmed"
+        self.recorded_dir = self.root / "recorded"
         self.metadata_path = self.root / "library.json"
         self.root.mkdir(parents=True, exist_ok=True)
         self.imported_dir.mkdir(exist_ok=True)
         self.trimmed_dir.mkdir(exist_ok=True)
+        self.recorded_dir.mkdir(exist_ok=True)
         self.data: dict[str, object] = {
             "entries": {},
             "last_directory": str(Path.home()),
             "scan_recursive": False,
         }
         self._load()
+
+    def _migrate_legacy_library(self) -> None:
+        """Copy the old project-local library into the local app-data directory once."""
+        if self.root.exists() or not self.legacy_root.exists():
+            self.root.mkdir(parents=True, exist_ok=True)
+            return
+        if self.root.resolve() == self.legacy_root.resolve():
+            return
+
+        self.root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(self.legacy_root, self.root)
+        metadata_path = self.root / "library.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(metadata, dict):
+            return
+
+        legacy_root = self.legacy_root.resolve()
+        migrated_root = self.root.resolve()
+
+        def rebase(value: object) -> object:
+            if not isinstance(value, str) or not value:
+                return value
+            candidate = Path(value)
+            try:
+                relative = candidate.resolve().relative_to(legacy_root)
+            except ValueError:
+                return value
+            return str(migrated_root / relative)
+
+        entries = metadata.get("entries")
+        if isinstance(entries, dict):
+            for record in entries.values():
+                if isinstance(record, dict):
+                    record["path"] = rebase(record.get("path"))
+                    record["source"] = rebase(record.get("source"))
+        temporary = metadata_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(metadata_path)
 
     @property
     def entries(self) -> dict[str, dict[str, str]]:
@@ -242,6 +315,10 @@ class SampleLibrary:
 
     def add_trimmed(self, path: Path) -> None:
         self._record(path, "managed")
+        self.save()
+
+    def add_recorded(self, path: Path) -> None:
+        self._record(path, "recorded")
         self.save()
 
     def scan_folder(self, folder: Path, recursive: bool) -> list[Path]:
@@ -969,7 +1046,7 @@ class WaveformEditor(QGroupBox):
             "zoom-out": "zoom-out.svg",
         }
         if kind in icon_files:
-            icon = QIcon(str(Path(__file__).resolve().parent / "icons" / icon_files[kind]))
+            icon = QIcon(str(resource_path("icons", icon_files[kind])))
             if not icon.isNull():
                 return icon
             return self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
@@ -1114,7 +1191,7 @@ class WaveformEditor(QGroupBox):
         if not self.file_path or not self.samples.size:
             return
         default_name = self.working_name if self.working_name == "untitled.wav" else f"{self.file_path.stem}-trimmed.wav"
-        default = Path(__file__).resolve().parent / "samples" / "trimmed" / default_name
+        default = app_data_dir() / "samples" / "trimmed" / default_name
         destination, _ = QFileDialog.getSaveFileName(self, "Save trimmed sample", str(default), "WAV files (*.wav)")
         if not destination:
             return
@@ -1139,6 +1216,224 @@ class WaveformEditor(QGroupBox):
         shutil.rmtree(self.preview_dir, ignore_errors=True)
 
 
+class RecordingPanel(QWidget):
+    saved = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, destination: Path) -> None:
+        super().__init__()
+        self.destination = destination
+        self.destination.mkdir(parents=True, exist_ok=True)
+        self.devices = []
+        self.audio_source: QAudioSource | None = None
+        self.output_file: QFile | None = None
+        self.recording_path: Path | None = None
+        self.recording_format: QAudioFormat | None = None
+        self.recording_state = "idle"
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.input_combo = QComboBox()
+        self.input_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.input_combo.setToolTip("Sound source")
+        layout.addWidget(self.input_combo, 1)
+
+        self.record_button = self._icon_button("Record", "record.svg")
+        self.record_button.clicked.connect(self.start_recording)
+        layout.addWidget(self.record_button)
+
+        self.pause_button = self._icon_button("Pause recording", "pause.svg")
+        self.pause_button.clicked.connect(self.toggle_pause)
+        layout.addWidget(self.pause_button)
+
+        self.stop_button = self._icon_button("Stop recording", "stop.svg")
+        self.stop_button.clicked.connect(self.stop_recording)
+        layout.addWidget(self.stop_button)
+
+        self.duration_label = QLabel("0:00")
+        self.duration_label.setMinimumWidth(42)
+        self.duration_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self.duration_label)
+
+        self.duration_timer = QTimer(self)
+        self.duration_timer.setInterval(100)
+        self.duration_timer.timeout.connect(self._update_duration)
+        self._refresh_devices()
+        self._refresh_controls()
+
+    def _icon_button(self, name: str, icon_name: str) -> QPushButton:
+        button = QPushButton()
+        button.setFixedSize(30, 30)
+        button.setIcon(bundled_icon(icon_name))
+        button.setIconSize(QSize(18, 18))
+        button.setToolTip(name)
+        button.setAccessibleName(name)
+        return button
+
+    def _refresh_devices(self) -> None:
+        self.input_combo.clear()
+        self.devices = QMediaDevices.audioInputs()
+        default = QMediaDevices.defaultAudioInput()
+        default_index = 0
+        for index, device in enumerate(self.devices):
+            self.input_combo.addItem(device.description())
+            if device.id() == default.id():
+                default_index = index
+        if self.devices:
+            self.input_combo.setCurrentIndex(default_index)
+
+    def _refresh_controls(self) -> None:
+        active = self.recording_state in {"recording", "paused"}
+        self.input_combo.setEnabled(not active and bool(self.devices))
+        self.record_button.setEnabled(not active and bool(self.devices))
+        self.pause_button.setEnabled(active)
+        self.stop_button.setEnabled(active)
+
+    def _capture_format(self, device) -> QAudioFormat | None:
+        preferred = device.preferredFormat()
+        if not preferred.isValid():
+            return None
+
+        capture_format = QAudioFormat()
+        capture_format.setSampleRate(preferred.sampleRate())
+        capture_format.setChannelCount(preferred.channelCount())
+        capture_format.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+        if device.isFormatSupported(capture_format):
+            return capture_format
+        return preferred
+
+    @staticmethod
+    def _wav_header(audio_format: QAudioFormat, data_size: int) -> bytes:
+        channels = max(1, audio_format.channelCount())
+        sample_rate = max(1, audio_format.sampleRate())
+        bytes_per_sample = max(1, audio_format.bytesPerSample())
+        bits_per_sample = bytes_per_sample * 8
+        block_align = channels * bytes_per_sample
+        byte_rate = sample_rate * block_align
+        format_code = 3 if audio_format.sampleFormat() == QAudioFormat.SampleFormat.Float else 1
+        return struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF",
+            36 + data_size,
+            b"WAVE",
+            b"fmt ",
+            16,
+            format_code,
+            channels,
+            sample_rate,
+            byte_rate,
+            block_align,
+            bits_per_sample,
+            b"data",
+            data_size,
+        )
+
+    def _next_path(self) -> Path:
+        candidate = self.destination / "recording.wav"
+        index = 2
+        while candidate.exists():
+            candidate = self.destination / f"recording ({index}).wav"
+            index += 1
+        return candidate
+
+    def start_recording(self) -> None:
+        if self.recording_state != "idle" or not self.devices:
+            return
+        device = self.devices[self.input_combo.currentIndex()]
+        audio_format = self._capture_format(device)
+        if audio_format is None:
+            self.failed.emit("The selected sound source has no usable recording format.")
+            return
+
+        path = self._next_path()
+        output_file = QFile(str(path))
+        if not output_file.open(QIODevice.OpenModeFlag.WriteOnly):
+            self.failed.emit(f"Could not create {path.name}.")
+            return
+        if output_file.write(self._wav_header(audio_format, 0)) != 44:
+            output_file.close()
+            path.unlink(missing_ok=True)
+            self.failed.emit(f"Could not initialize {path.name}.")
+            return
+
+        source = QAudioSource(device, audio_format, self)
+        source.stateChanged.connect(self._source_state_changed)
+        source.start(output_file)
+        self.audio_source = source
+        self.output_file = output_file
+        self.recording_path = path
+        self.recording_format = audio_format
+        self.recording_state = "recording"
+        self.duration_label.setText("0:00")
+        self.duration_timer.start()
+        self._refresh_controls()
+
+    def toggle_pause(self) -> None:
+        if not self.audio_source:
+            return
+        if self.recording_state == "recording":
+            self.audio_source.suspend()
+            self.recording_state = "paused"
+            self.duration_timer.stop()
+            self.pause_button.setIcon(bundled_icon("play.svg"))
+            self.pause_button.setToolTip("Resume recording")
+            self.pause_button.setAccessibleName("Resume recording")
+        elif self.recording_state == "paused":
+            self.audio_source.resume()
+            self.recording_state = "recording"
+            self.duration_timer.start()
+            self.pause_button.setIcon(bundled_icon("pause.svg"))
+            self.pause_button.setToolTip("Pause recording")
+            self.pause_button.setAccessibleName("Pause recording")
+        self._refresh_controls()
+
+    def stop_recording(self) -> None:
+        if self.recording_state == "idle":
+            return
+        source = self.audio_source
+        output_file = self.output_file
+        path = self.recording_path
+        audio_format = self.recording_format
+        self.recording_state = "idle"
+        self.duration_timer.stop()
+        if source:
+            source.stop()
+        if output_file and path and audio_format:
+            data_size = max(0, int(output_file.size()) - 44)
+            output_file.seek(0)
+            output_file.write(self._wav_header(audio_format, data_size))
+            output_file.close()
+        self.audio_source = None
+        self.output_file = None
+        self.recording_path = None
+        self.recording_format = None
+        self.pause_button.setIcon(bundled_icon("pause.svg"))
+        self.pause_button.setToolTip("Pause recording")
+        self.pause_button.setAccessibleName("Pause recording")
+        self._refresh_controls()
+        if path and path.exists() and path.stat().st_size > 44:
+            self.saved.emit(path)
+        elif path:
+            path.unlink(missing_ok=True)
+            self.failed.emit("No audio was captured.")
+
+    def _update_duration(self) -> None:
+        if self.audio_source:
+            self.duration_label.setText(format_time(self.audio_source.processedUSecs() // 1000))
+
+    def _source_state_changed(self, _state) -> None:
+        if self.audio_source and self.audio_source.error().name != "NoError":
+            error_name = self.audio_source.error().name
+            self.stop_recording()
+            self.failed.emit(f"Recording error: {error_name}")
+
+    def close_recording(self) -> None:
+        if self.recording_state != "idle":
+            self.stop_recording()
+
+
 class AudioSplitter(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1146,12 +1441,12 @@ class AudioSplitter(QMainWindow):
         self.split_thread: SplitThread | None = None
         self.temp_root = Path(tempfile.mkdtemp(prefix="audio-splitter-"))
         self.cards: dict[str, StemCard] = {}
-        self.sample_library = SampleLibrary(Path(__file__).resolve().parent)
+        self.sample_library = SampleLibrary()
         self.current_samples_directory: Path | None = None
         self.last_explorer_directory = self.sample_library.last_directory
         self.showing_library = False
 
-        self.setWindowTitle("Stem Splitter")
+        self.setWindowTitle(APP_NAME)
         self.setFixedSize(1120, 760)
         self.setAcceptDrops(True)
 
@@ -1240,6 +1535,11 @@ class AudioSplitter(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(8)
+
+        self.recording_panel = RecordingPanel(self.sample_library.recorded_dir)
+        self.recording_panel.saved.connect(self._recording_saved)
+        self.recording_panel.failed.connect(self._recording_failed)
+        layout.addWidget(self.recording_panel)
 
         view_switch = QHBoxLayout()
         self.explorer_view_button = QPushButton("Explorer")
@@ -1399,7 +1699,11 @@ class AudioSplitter(QMainWindow):
         references = QTreeWidgetItem(["References"])
         references.setData(0, Qt.ItemDataRole.UserRole, "references")
         self.library_tree.addTopLevelItem(references)
-        for directory in (self.sample_library.imported_dir, self.sample_library.trimmed_dir):
+        for directory in (
+            self.sample_library.imported_dir,
+            self.sample_library.recorded_dir,
+            self.sample_library.trimmed_dir,
+        ):
             item = QTreeWidgetItem([directory.name])
             item.setData(0, Qt.ItemDataRole.UserRole, str(directory))
             self.library_tree.addTopLevelItem(item)
@@ -1492,6 +1796,18 @@ class AudioSplitter(QMainWindow):
         self.samples_status.setText(f"Copied {len(copied)} folder file(s) into the library")
         if self.showing_library:
             self._show_library()
+
+    def _recording_saved(self, path: Path) -> None:
+        self.sample_library.add_recorded(path)
+        self.samples_status.setText(f"Saved {path.name}")
+        self.preview_player.set_file(path)
+        self.waveform_editor.set_file(path)
+        if self.showing_library:
+            self._populate_library_tree()
+            self._show_directory(self.sample_library.recorded_dir)
+
+    def _recording_failed(self, message: str) -> None:
+        self.samples_status.setText(message)
 
     def _preview_trim_range(self, start_ms: int, end_ms: int) -> None:
         self.preview_player.play_selection(start_ms, end_ms)
@@ -1625,6 +1941,7 @@ class AudioSplitter(QMainWindow):
     def closeEvent(self, event) -> None:
         for card in self.cards.values():
             card.close_player()
+        self.recording_panel.close_recording()
         self.preview_player.close_player()
         self.waveform_editor.close_editor()
         if self.split_thread and self.split_thread.isRunning():
@@ -1711,6 +2028,9 @@ def apply_style(app: QApplication) -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    app.setDesktopFileName(APP_SLUG)
     apply_style(app)
     window = AudioSplitter()
     window.show()

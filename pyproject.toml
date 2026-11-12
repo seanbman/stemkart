@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stemkart"
+version = "0.1.0"
+description = "A local desktop app for stem splitting, sample organization, and recording"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.6",
+    "demucs>=4.0.1",
+    "numpy>=1.26,<3",
+    "torch==2.5.1+cpu",
+]
+
+[project.scripts]
+stemkart = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

@@ -1,13 +1,13 @@
-# Stem Splitter
+# StemKart
 
-A small PyQt6 desktop app for browsing samples and splitting one music track into four WAV stems with Demucs:
+StemKart is a local PyQt6 desktop app for recording, organizing samples, and splitting one music track into four WAV stems with Demucs:
 
 - vocals
 - drums
 - bass
 - other
 
-The Samples tab provides a two-pane disk browser, persistent external references, optional copies into a local library, preview playback, and waveform-based trimming to new WAV files. The Stem Splitter tab has playback for every stem and three export choices: save one stem, put every stem directly into an existing folder, or create a new named folder containing every stem.
+The Samples tab provides a two-pane disk browser, persistent external references, optional copies into a local library, recording, preview playback, and waveform-based trimming to new WAV files. The Stem Splitter tab has playback for every stem and three export choices: save one stem, put every stem directly into an existing folder, or create a new named folder containing every stem.
 
 ## Setup
 
@@ -24,7 +24,7 @@ Run it with:
 .venv/bin/python main.py
 ```
 
-The first split downloads the Demucs model and may take a few minutes. Generated stems are held in a temporary directory until the app closes; use one of the export buttons to keep them. Sample-library metadata and copied/trimmed files are stored under `samples/` beside the application, while referenced source files stay in their original locations.
+The first split downloads the Demucs model and may take a few minutes. Generated stems are held in a temporary directory until the app closes; use one of the export buttons to keep them. Sample-library metadata and copied/trimmed/recorded files are stored locally under the platform's application-data directory (on Linux, normally `~/.local/share/stemkart/samples/`), while referenced source files stay in their original locations. StemKart does not upload audio files.
 
 ## Notes
 
