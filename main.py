@@ -3,13 +3,16 @@ from __future__ import annotations
 import re
 import os
 import json
+import signal
 import selectors
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import wave
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -192,6 +195,7 @@ class SampleLibrary:
             "scan_recursive": False,
         }
         self._load()
+        self.sync_legacy_additions()
 
     def _migrate_legacy_library(self) -> None:
         """Copy the old project-local library into the local app-data directory once."""
@@ -229,10 +233,36 @@ class SampleLibrary:
             for record in entries.values():
                 if isinstance(record, dict):
                     record["path"] = rebase(record.get("path"))
-                    record["source"] = rebase(record.get("source"))
+                record["source"] = rebase(record.get("source"))
         temporary = metadata_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
         temporary.replace(metadata_path)
+
+    def sync_legacy_additions(self) -> int:
+        """Bring new source-tree folders/files into the local library without overwriting it."""
+        if not self.legacy_root.is_dir() or self.legacy_root.resolve() == self.root.resolve():
+            return 0
+
+        copied = 0
+        try:
+            source_paths = sorted(self.legacy_root.rglob("*"), key=lambda path: len(path.parts))
+        except OSError:
+            return 0
+        for source in source_paths:
+            relative = source.relative_to(self.legacy_root)
+            if relative.name == "library.json":
+                continue
+            destination = self.root / relative
+            try:
+                if source.is_dir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                elif source.is_file() and not destination.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
+                    copied += 1
+            except OSError:
+                continue
+        return copied
 
     @property
     def entries(self) -> dict[str, dict[str, str]]:
@@ -271,6 +301,17 @@ class SampleLibrary:
         self.data["scan_recursive"] = enabled
         self.save()
 
+    def is_library_path(self, path: Path) -> bool:
+        """Return whether a path is inside StemKart's local library root."""
+        try:
+            path.resolve().relative_to(self.root.resolve())
+        except ValueError:
+            return False
+        return True
+
+    def protected_directories(self) -> set[Path]:
+        return {self.imported_dir.resolve(), self.recorded_dir.resolve(), self.trimmed_dir.resolve()}
+
     def _record(self, path: Path, kind: str, source: Path | None = None) -> None:
         resolved = path.resolve()
         self.entries[str(resolved)] = {
@@ -301,17 +342,68 @@ class SampleLibrary:
             index += 1
         return candidate
 
-    def copy_into_library(self, paths: list[Path]) -> list[Path]:
+    def copy_into_library(self, paths: list[Path], destination: Path | None = None) -> list[Path]:
+        destination = destination or self.imported_dir
+        if not self.is_library_path(destination):
+            destination = self.imported_dir
+        destination.mkdir(parents=True, exist_ok=True)
         copied: list[Path] = []
         for source in paths:
             if not is_audio_file(source):
                 continue
-            destination = self._unique_destination(self.imported_dir, source.name)
-            shutil.copy2(source, destination)
-            self._record(destination, "managed", source)
-            copied.append(destination)
+            target = self._unique_destination(destination, source.name)
+            shutil.copy2(source, target)
+            self._record(target, "managed", source)
+            copied.append(target)
         self.save()
         return copied
+
+    def rename_library_directory(self, path: Path, name: str) -> Path | None:
+        resolved = path.resolve()
+        if (
+            not path.is_dir()
+            or not self.is_library_path(path)
+            or resolved == self.root.resolve()
+            or resolved in self.protected_directories()
+        ):
+            return None
+        destination = path.parent / name
+        if destination.exists() or not self.is_library_path(destination):
+            return None
+        path.rename(destination)
+
+        old_root = resolved
+        new_root = destination.resolve()
+        for record in self.entries.values():
+            if not isinstance(record, dict):
+                continue
+            for field in ("path", "source"):
+                value = record.get(field)
+                if not isinstance(value, str) or not value:
+                    continue
+                candidate = Path(value)
+                try:
+                    relative = candidate.resolve().relative_to(old_root)
+                except ValueError:
+                    continue
+                record[field] = str(new_root / relative)
+        self.save()
+        return destination
+
+    def remove_library_directory(self, path: Path) -> bool:
+        resolved = path.resolve()
+        if (
+            not path.is_dir()
+            or not self.is_library_path(path)
+            or resolved == self.root.resolve()
+            or resolved in self.protected_directories()
+        ):
+            return False
+        try:
+            path.rmdir()
+        except OSError:
+            return False
+        return True
 
     def add_trimmed(self, path: Path) -> None:
         self._record(path, "managed")
@@ -322,6 +414,8 @@ class SampleLibrary:
         self.save()
 
     def scan_folder(self, folder: Path, recursive: bool) -> list[Path]:
+        if not folder.is_dir():
+            return []
         paths = folder.rglob("*") if recursive else folder.iterdir()
         return sorted((path for path in paths if is_audio_file(path)), key=lambda path: path.name.casefold())
 
@@ -603,8 +697,8 @@ class StemCard(QGroupBox):
 class PreviewPlayer(QGroupBox):
     playhead_changed = pyqtSignal(int, int)
 
-    def __init__(self) -> None:
-        super().__init__("")
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__("", parent)
         self.file_path: Path | None = None
         self.clip_start = 0
         self.clip_end: int | None = None
@@ -750,6 +844,10 @@ class PreviewPlayer(QGroupBox):
         end = self.clip_end or self.player.duration()
         self.player.setPosition(max(self.clip_start, min(end, position)))
 
+    def seek_absolute(self, position: int) -> None:
+        duration = self.player.duration()
+        self.player.setPosition(max(0, min(duration, position)) if duration > 0 else max(0, position))
+
     def _position_changed(self, position: int) -> None:
         if self.clip_end and position >= self.clip_end:
             self.player.pause()
@@ -816,6 +914,7 @@ class WaveformDecodeThread(QThread):
 
 class WaveformWidget(QWidget):
     range_changed = pyqtSignal(int, int)
+    playhead_requested = pyqtSignal(int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -828,6 +927,8 @@ class WaveformWidget(QWidget):
         self.view_end_ratio = 1.0
         self.playhead_ratio: float | None = None
         self.dragging: str | None = None
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def set_samples(self, samples: np.ndarray, sample_rate: int) -> None:
         self.samples = samples
@@ -859,6 +960,11 @@ class WaveformWidget(QWidget):
         self.view_end_ratio = 1.0
         self.update()
 
+    def set_marker_from_playhead(self, marker: str) -> None:
+        if self.playhead_ratio is None:
+            return
+        self._set_handle(marker, self.playhead_ratio)
+
     def range_samples(self) -> tuple[int, int]:
         if not self.samples.size:
             return 0, 0
@@ -874,28 +980,91 @@ class WaveformWidget(QWidget):
         return self.view_start_ratio + local_ratio * visible_ratio
 
     def _set_handle(self, handle: str, ratio: float) -> None:
+        minimum_gap = 1.0 / max(1, len(self.samples))
         if handle == "start":
-            self.start_ratio = min(ratio, self.end_ratio - 0.001)
+            self.start_ratio = max(0.0, min(ratio, self.end_ratio - minimum_gap))
         else:
-            self.end_ratio = max(ratio, self.start_ratio + 0.001)
+            self.end_ratio = min(1.0, max(ratio, self.start_ratio + minimum_gap))
         self.update()
         self._emit_range()
 
+    def _marker_x_positions(self) -> tuple[float, float]:
+        view_ratio = max(0.001, self.view_end_ratio - self.view_start_ratio)
+        width = max(1, self.width())
+        return (
+            (self.start_ratio - self.view_start_ratio) / view_ratio * width,
+            (self.end_ratio - self.view_start_ratio) / view_ratio * width,
+        )
+
+    def _playhead_x(self) -> float | None:
+        if self.playhead_ratio is None:
+            return None
+        view_ratio = max(0.001, self.view_end_ratio - self.view_start_ratio)
+        return (self.playhead_ratio - self.view_start_ratio) / view_ratio * max(1, self.width())
+
+    def _interaction_target(self, x: float) -> str | None:
+        candidates: list[tuple[float, str]] = []
+        start_x, end_x = self._marker_x_positions()
+        start_distance = abs(x - start_x)
+        end_distance = abs(x - end_x)
+        if start_distance <= 20:
+            candidates.append((start_distance, "start"))
+        if end_distance <= 20:
+            candidates.append((end_distance, "end"))
+        playhead_x = self._playhead_x()
+        if playhead_x is not None:
+            playhead_distance = abs(x - playhead_x)
+            if playhead_distance <= 14:
+                candidates.append((playhead_distance, "playhead"))
+        return min(candidates)[1] if candidates else None
+
+    def _set_playhead_ratio(self, ratio: float) -> None:
+        self.playhead_ratio = max(0.0, min(1.0, ratio))
+        self.update()
+        position_ms = round(self.playhead_ratio * len(self.samples) / self.sample_rate * 1000)
+        self.playhead_requested.emit(position_ms)
+
+    def _update_cursor(self, x: float) -> None:
+        if self.dragging:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        elif self._interaction_target(x):
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
     def mousePressEvent(self, event) -> None:
-        if not self.samples.size:
+        if not self.samples.size or event.button() != Qt.MouseButton.LeftButton:
             return
-        ratio = self._ratio_for_x(event.position().x())
-        start_distance = abs(ratio - self.start_ratio)
-        end_distance = abs(ratio - self.end_ratio)
-        self.dragging = "start" if start_distance <= end_distance else "end"
-        self._set_handle(self.dragging, ratio)
+        x = event.position().x()
+        ratio = self._ratio_for_x(x)
+        target = self._interaction_target(x)
+        if target in {"start", "end"}:
+            self.dragging = target
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self._set_handle(target, ratio)
+            return
+        if target == "playhead":
+            self.dragging = "playhead"
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        else:
+            self.dragging = None
+        self._set_playhead_ratio(ratio)
 
     def mouseMoveEvent(self, event) -> None:
-        if self.dragging:
+        if self.dragging in {"start", "end"}:
             self._set_handle(self.dragging, self._ratio_for_x(event.position().x()))
+        elif self.dragging == "playhead":
+            self._set_playhead_ratio(self._ratio_for_x(event.position().x()))
+        self._update_cursor(event.position().x())
 
-    def mouseReleaseEvent(self, _event) -> None:
+    def mouseReleaseEvent(self, event) -> None:
         self.dragging = None
+        self._update_cursor(event.position().x())
+
+    def leaveEvent(self, event) -> None:
+        if not self.dragging:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().leaveEvent(event)
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
@@ -929,21 +1098,24 @@ class WaveformWidget(QWidget):
             peak = float(np.max(np.abs(self.samples[start:end])))
             half_height = max(1, round(peak * (height // 2 - 4)))
             painter.drawLine(x, center - half_height, x, center + half_height)
-        handle_pen = QPen(self.palette().text().color(), 2)
-        painter.setPen(handle_pen)
+        marker_color = QColor(0, 0, 0)
+        painter.setPen(QPen(marker_color, 2))
         painter.drawLine(selected_left, 0, selected_left, height)
+        painter.setPen(QPen(marker_color, 2))
         painter.drawLine(selected_right, 0, selected_right, height)
         if self.playhead_ratio is not None and self.view_start_ratio <= self.playhead_ratio <= self.view_end_ratio:
             playhead_x = round(
                 (self.playhead_ratio - self.view_start_ratio) / view_ratio * width
             )
-            painter.setPen(QPen(self.palette().link().color(), 2))
+            painter.setPen(QPen(QColor(220, 40, 40), 3))
             painter.drawLine(playhead_x, 0, playhead_x, height)
 
 
 class WaveformEditor(QGroupBox):
     saved = pyqtSignal(object)
     working_file_changed = pyqtSignal(object)
+    playhead_requested = pyqtSignal(int)
+    split_requested = pyqtSignal(object)
 
     def __init__(self) -> None:
         super().__init__("")
@@ -964,6 +1136,7 @@ class WaveformEditor(QGroupBox):
         self.waveform.setMinimumHeight(120)
         self.waveform.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.waveform.range_changed.connect(self._range_changed)
+        self.waveform.playhead_requested.connect(self._waveform_playhead_requested)
         layout.addWidget(self.waveform)
         controls = QHBoxLayout()
         controls.setSpacing(3)
@@ -971,6 +1144,14 @@ class WaveformEditor(QGroupBox):
         self.range_label = QLabel("Full file")
         self.range_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         controls.addWidget(self.range_label)
+        self.set_start_button = QPushButton("Set Start")
+        self.set_start_button.setToolTip("Set the start marker to the current playhead position")
+        self.set_start_button.clicked.connect(self._set_start_from_playhead)
+        controls.addWidget(self.set_start_button)
+        self.set_end_button = QPushButton("Set End")
+        self.set_end_button.setToolTip("Set the end marker to the current playhead position")
+        self.set_end_button.clicked.connect(self._set_end_from_playhead)
+        controls.addWidget(self.set_end_button)
         controls.addStretch()
         self.play_button = self._icon_button("Play", QStyle.StandardPixmap.SP_MediaPlay)
         self.play_button.setIcon(self._editor_icon("play"))
@@ -1012,6 +1193,10 @@ class WaveformEditor(QGroupBox):
         self.apply_trim_button.setIcon(self._editor_icon("scissors"))
         self.apply_trim_button.clicked.connect(self._apply_trim)
         controls.addWidget(self.apply_trim_button)
+        self.split_sample_button = self._icon_button("Split sample", QStyle.StandardPixmap.SP_DialogApplyButton)
+        self.split_sample_button.setIcon(self._editor_icon("split"))
+        self.split_sample_button.clicked.connect(self._confirm_split_sample)
+        controls.addWidget(self.split_sample_button)
         self.save_button = self._icon_button("Save trimmed WAV", QStyle.StandardPixmap.SP_DialogSaveButton)
         self.save_button.setIcon(self._editor_icon("floppy"))
         self.save_button.clicked.connect(self.save_trimmed)
@@ -1037,6 +1222,7 @@ class WaveformEditor(QGroupBox):
             "pause": "pause.svg",
             "stop": "stop.svg",
             "scissors": "edit-cut.svg",
+            "split": "split.svg",
             "rewind": "rewind.svg",
             "fast-forward": "fast-forward.svg",
             "skip-start": "skip-start.svg",
@@ -1074,13 +1260,42 @@ class WaveformEditor(QGroupBox):
             self.zoom_button,
             self.reset_zoom_button,
             self.apply_trim_button,
+            self.split_sample_button,
             self.save_button,
         ):
             button.setEnabled(enabled)
+        marker_enabled = enabled and self.waveform.playhead_ratio is not None
+        self.set_start_button.setEnabled(marker_enabled)
+        self.set_end_button.setEnabled(marker_enabled)
         self.undo_button.setEnabled(enabled and self.undo_state is not None)
 
     def set_playhead(self, position_ms: int, duration_ms: int) -> None:
         self.waveform.set_playhead(position_ms, duration_ms)
+        self._set_action_state(bool(self.samples.size))
+
+    def _set_start_from_playhead(self) -> None:
+        self.waveform.set_marker_from_playhead("start")
+
+    def _set_end_from_playhead(self) -> None:
+        self.waveform.set_marker_from_playhead("end")
+
+    def _confirm_split_sample(self) -> None:
+        if not self.samples.size:
+            return
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setWindowTitle("Split sample")
+        dialog.setText("Split the current sample into stems now?")
+        split_button = dialog.addButton("Split sample", QMessageBox.ButtonRole.AcceptRole)
+        dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(split_button)
+        dialog.exec()
+        if dialog.clickedButton() == split_button:
+            self.split_requested.emit(self._write_split_source())
+
+    def _waveform_playhead_requested(self, position_ms: int) -> None:
+        self._set_action_state(bool(self.samples.size))
+        self.playhead_requested.emit(position_ms)
 
     def set_preview_callback(self, callback) -> None:
         self.preview_range_requested = callback
@@ -1156,6 +1371,17 @@ class WaveformEditor(QGroupBox):
             output.writeframes((pcm * 32767).astype(np.int16).tobytes())
         return destination
 
+    def _write_split_source(self) -> Path:
+        name = safe_folder_name(Path(self.working_name or "split-source").stem) + ".wav"
+        destination = self.preview_dir / name
+        pcm = np.clip(self.samples, -1.0, 1.0)
+        with wave.open(str(destination), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(self.sample_rate)
+            output.writeframes((pcm * 32767).astype(np.int16).tobytes())
+        return destination
+
     def _emit_working_preview(self) -> None:
         if self.working_name != "untitled.wav" and self.file_path:
             self.working_file_changed.emit(self.file_path)
@@ -1216,6 +1442,93 @@ class WaveformEditor(QGroupBox):
         shutil.rmtree(self.preview_dir, ignore_errors=True)
 
 
+@dataclass
+class RecordingTarget:
+    label: str
+    kind: str
+    device: object | None = None
+    node_id: int | None = None
+
+
+def _pipewire_objects() -> list[dict[str, object]]:
+    if not shutil.which("pw-dump"):
+        return []
+    try:
+        result = subprocess.run(
+            ["pw-dump"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    try:
+        objects = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    return [item for item in objects if isinstance(item, dict)] if isinstance(objects, list) else []
+
+
+def _pipewire_ports(objects: list[dict[str, object]], node_id: int, direction: str) -> list[int]:
+    ports: list[tuple[int, int]] = []
+    for object_data in objects:
+        if object_data.get("type") != "PipeWire:Interface:Port":
+            continue
+        port_id = object_data.get("id")
+        info = object_data.get("info")
+        props = info.get("props") if isinstance(info, dict) else None
+        if not isinstance(port_id, int) or not isinstance(props, dict):
+            continue
+        if props.get("node.id") != node_id or props.get("port.direction") != direction:
+            continue
+        port_index = props.get("port.id")
+        ports.append((port_index if isinstance(port_index, int) else port_id, port_id))
+    return [port_id for _, port_id in sorted(ports)]
+
+
+def pipewire_recording_targets() -> list[RecordingTarget]:
+    """Discover PipeWire sinks and active application playback streams."""
+    if not shutil.which("pw-record"):
+        return []
+    objects = _pipewire_objects()
+    if not objects:
+        return []
+
+    targets: list[RecordingTarget] = []
+    application_targets: list[RecordingTarget] = []
+    for object_data in objects:
+        if not isinstance(object_data, dict) or object_data.get("type") != "PipeWire:Interface:Node":
+            continue
+        node_id = object_data.get("id")
+        info = object_data.get("info")
+        props = info.get("props") if isinstance(info, dict) else None
+        if not isinstance(node_id, int) or not isinstance(props, dict):
+            continue
+
+        media_class = str(props.get("media.class", ""))
+        description = str(
+            props.get("node.description")
+            or props.get("node.nick")
+            or props.get("node.name")
+            or "Unnamed audio node"
+        )
+        if media_class == "Audio/Sink":
+            targets.append(RecordingTarget(f"System audio — {description}", "pipewire_sink", node_id=node_id))
+        elif media_class == "Stream/Output/Audio":
+            application = str(
+                props.get("application.name")
+                or props.get("application.process.binary")
+                or description
+            )
+            application_targets.append(
+                RecordingTarget(f"Application audio — {application}", "pipewire_app", node_id=node_id)
+            )
+    return targets + sorted(application_targets, key=lambda target: target.label.casefold())
+
+
 class RecordingPanel(QWidget):
     saved = pyqtSignal(object)
     failed = pyqtSignal(str)
@@ -1224,12 +1537,15 @@ class RecordingPanel(QWidget):
         super().__init__()
         self.destination = destination
         self.destination.mkdir(parents=True, exist_ok=True)
-        self.devices = []
+        self.targets: list[RecordingTarget] = []
         self.audio_source: QAudioSource | None = None
         self.output_file: QFile | None = None
+        self.pipewire_process: subprocess.Popen[bytes] | None = None
         self.recording_path: Path | None = None
         self.recording_format: QAudioFormat | None = None
         self.recording_state = "idle"
+        self.recording_started_at: float | None = None
+        self.elapsed_before_pause = 0.0
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1239,6 +1555,13 @@ class RecordingPanel(QWidget):
         self.input_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.input_combo.setToolTip("Sound source")
         layout.addWidget(self.input_combo, 1)
+
+        self.refresh_button = QPushButton("↻")
+        self.refresh_button.setFixedSize(30, 30)
+        self.refresh_button.setToolTip("Refresh audio sources")
+        self.refresh_button.setAccessibleName("Refresh audio sources")
+        self.refresh_button.clicked.connect(self._refresh_devices)
+        layout.addWidget(self.refresh_button)
 
         self.record_button = self._icon_button("Record", "record.svg")
         self.record_button.clicked.connect(self.start_recording)
@@ -1260,6 +1583,7 @@ class RecordingPanel(QWidget):
         self.duration_timer = QTimer(self)
         self.duration_timer.setInterval(100)
         self.duration_timer.timeout.connect(self._update_duration)
+        self.duration_timer.timeout.connect(self._check_pipewire_recording)
         self._refresh_devices()
         self._refresh_controls()
 
@@ -1273,21 +1597,34 @@ class RecordingPanel(QWidget):
         return button
 
     def _refresh_devices(self) -> None:
+        if self.recording_state != "idle":
+            return
         self.input_combo.clear()
-        self.devices = QMediaDevices.audioInputs()
+        self.targets = []
+        devices = QMediaDevices.audioInputs()
         default = QMediaDevices.defaultAudioInput()
-        default_index = 0
-        for index, device in enumerate(self.devices):
-            self.input_combo.addItem(device.description())
+        default_target_index = 0
+        for index, device in enumerate(devices):
+            self.targets.append(RecordingTarget(f"Microphone — {device.description()}", "qt", device=device))
+            self.input_combo.addItem(self.targets[-1].label)
             if device.id() == default.id():
-                default_index = index
-        if self.devices:
-            self.input_combo.setCurrentIndex(default_index)
+                default_target_index = index
+
+        pipewire_targets = pipewire_recording_targets()
+        self.targets.extend(pipewire_targets)
+        for target in pipewire_targets:
+            self.input_combo.addItem(target.label)
+
+        if self.targets:
+            self.input_combo.setCurrentIndex(default_target_index)
+        else:
+            self.input_combo.addItem("No audio sources available")
 
     def _refresh_controls(self) -> None:
         active = self.recording_state in {"recording", "paused"}
-        self.input_combo.setEnabled(not active and bool(self.devices))
-        self.record_button.setEnabled(not active and bool(self.devices))
+        self.input_combo.setEnabled(not active and bool(self.targets))
+        self.refresh_button.setEnabled(not active)
+        self.record_button.setEnabled(not active and bool(self.targets))
         self.pause_button.setEnabled(active)
         self.stop_button.setEnabled(active)
 
@@ -1339,9 +1676,14 @@ class RecordingPanel(QWidget):
         return candidate
 
     def start_recording(self) -> None:
-        if self.recording_state != "idle" or not self.devices:
+        if self.recording_state != "idle" or not self.targets:
             return
-        device = self.devices[self.input_combo.currentIndex()]
+        target = self.targets[self.input_combo.currentIndex()]
+        if target.kind.startswith("pipewire"):
+            self._start_pipewire_recording(target)
+            return
+
+        device = target.device
         audio_format = self._capture_format(device)
         if audio_format is None:
             self.failed.emit("The selected sound source has no usable recording format.")
@@ -1366,22 +1708,138 @@ class RecordingPanel(QWidget):
         self.recording_path = path
         self.recording_format = audio_format
         self.recording_state = "recording"
+        self.recording_started_at = time.monotonic()
+        self.elapsed_before_pause = 0.0
         self.duration_label.setText("0:00")
         self.duration_timer.start()
         self._refresh_controls()
 
+    def _start_pipewire_recording(self, target: RecordingTarget) -> None:
+        if target.node_id is None:
+            self.failed.emit("The selected PipeWire source has no usable node.")
+            return
+        path = self._next_path()
+        target_argument = "0" if target.kind == "pipewire_app" else str(target.node_id)
+        command = [
+            "pw-record",
+            "--target",
+            target_argument,
+            "--rate",
+            "48000",
+            "--channels",
+            "2",
+            "--format",
+            "s16",
+            "-P",
+            "application.name=StemKart",
+            str(path),
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            self.failed.emit(f"Could not start PipeWire recording: {exc}")
+            return
+
+        if target.kind == "pipewire_app":
+            error = self._link_pipewire_application(process, target.node_id)
+            if error:
+                self._finish_pipewire_process(process)
+                path.unlink(missing_ok=True)
+                self.failed.emit(error)
+                return
+
+        self.pipewire_process = process
+        self.recording_path = path
+        self.recording_format = None
+        self.recording_state = "recording"
+        self.recording_started_at = time.monotonic()
+        self.elapsed_before_pause = 0.0
+        self.duration_label.setText("0:00")
+        self.duration_timer.start()
+        self._refresh_controls()
+
+    def _link_pipewire_application(self, process: subprocess.Popen[bytes], node_id: int | None) -> str | None:
+        if node_id is None:
+            return "The selected application has no usable PipeWire node."
+        if not shutil.which("pw-link"):
+            return "The pw-link command is required for application audio capture."
+
+        deadline = time.monotonic() + 2.0
+        recorder_node_id: int | None = None
+        objects: list[dict[str, object]] = []
+        while time.monotonic() < deadline:
+            objects = _pipewire_objects()
+            for object_data in objects:
+                if object_data.get("type") != "PipeWire:Interface:Node":
+                    continue
+                info = object_data.get("info")
+                props = info.get("props") if isinstance(info, dict) else None
+                if not isinstance(props, dict) or props.get("application.name") != APP_NAME:
+                    continue
+                if props.get("media.class") == "Stream/Input/Audio" and isinstance(object_data.get("id"), int):
+                    recorder_node_id = object_data["id"]
+                    break
+            if recorder_node_id is not None:
+                break
+            if process.poll() is not None:
+                return "PipeWire stopped the application recording before it started."
+            time.sleep(0.05)
+
+        if recorder_node_id is None:
+            return "StemKart could not find its PipeWire recording stream."
+
+        application_ports: list[int] = []
+        recorder_ports: list[int] = []
+        while time.monotonic() < deadline:
+            objects = _pipewire_objects()
+            application_ports = _pipewire_ports(objects, node_id, "out")
+            recorder_ports = _pipewire_ports(objects, recorder_node_id, "in")
+            if application_ports and recorder_ports:
+                break
+            time.sleep(0.05)
+        if not application_ports or not recorder_ports:
+            return "The selected application has no capturable audio ports."
+
+        for output_port, input_port in zip(application_ports, recorder_ports):
+            try:
+                result = subprocess.run(
+                    ["pw-link", str(output_port), str(input_port)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=2,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                return f"Could not connect to the application audio stream: {exc}"
+            if result.returncode != 0:
+                details = result.stderr.strip() or "unknown PipeWire link error"
+                return f"Could not connect to the application audio stream: {details}"
+        return None
+
     def toggle_pause(self) -> None:
-        if not self.audio_source:
+        if not self.audio_source and not self.pipewire_process:
             return
         if self.recording_state == "recording":
-            self.audio_source.suspend()
+            if self.audio_source:
+                self.audio_source.suspend()
+            elif self.pipewire_process:
+                self.elapsed_before_pause += time.monotonic() - (self.recording_started_at or time.monotonic())
+                self.pipewire_process.send_signal(signal.SIGSTOP)
             self.recording_state = "paused"
             self.duration_timer.stop()
             self.pause_button.setIcon(bundled_icon("play.svg"))
             self.pause_button.setToolTip("Resume recording")
             self.pause_button.setAccessibleName("Resume recording")
         elif self.recording_state == "paused":
-            self.audio_source.resume()
+            if self.audio_source:
+                self.audio_source.resume()
+            elif self.pipewire_process:
+                self.pipewire_process.send_signal(signal.SIGCONT)
+                self.recording_started_at = time.monotonic()
             self.recording_state = "recording"
             self.duration_timer.start()
             self.pause_button.setIcon(bundled_icon("pause.svg"))
@@ -1394,12 +1852,15 @@ class RecordingPanel(QWidget):
             return
         source = self.audio_source
         output_file = self.output_file
+        pipewire_process = self.pipewire_process
         path = self.recording_path
         audio_format = self.recording_format
         self.recording_state = "idle"
         self.duration_timer.stop()
         if source:
             source.stop()
+        if pipewire_process:
+            self._finish_pipewire_process(pipewire_process)
         if output_file and path and audio_format:
             data_size = max(0, int(output_file.size()) - 44)
             output_file.seek(0)
@@ -1407,8 +1868,11 @@ class RecordingPanel(QWidget):
             output_file.close()
         self.audio_source = None
         self.output_file = None
+        self.pipewire_process = None
         self.recording_path = None
         self.recording_format = None
+        self.recording_started_at = None
+        self.elapsed_before_pause = 0.0
         self.pause_button.setIcon(bundled_icon("pause.svg"))
         self.pause_button.setToolTip("Pause recording")
         self.pause_button.setAccessibleName("Pause recording")
@@ -1422,12 +1886,53 @@ class RecordingPanel(QWidget):
     def _update_duration(self) -> None:
         if self.audio_source:
             self.duration_label.setText(format_time(self.audio_source.processedUSecs() // 1000))
+        elif self.pipewire_process and self.recording_started_at is not None:
+            elapsed = self.elapsed_before_pause + time.monotonic() - self.recording_started_at
+            self.duration_label.setText(format_time(round(elapsed * 1000)))
+
+    @staticmethod
+    def _finish_pipewire_process(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is None:
+            process.send_signal(signal.SIGCONT)
+            process.send_signal(signal.SIGINT)
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+    def _pipewire_error(self, process: subprocess.Popen[bytes]) -> str:
+        if process.stderr is None:
+            return "PipeWire recording failed."
+        details = process.stderr.read().decode("utf-8", errors="replace").strip()
+        return details or "PipeWire recording failed."
 
     def _source_state_changed(self, _state) -> None:
         if self.audio_source and self.audio_source.error().name != "NoError":
             error_name = self.audio_source.error().name
             self.stop_recording()
             self.failed.emit(f"Recording error: {error_name}")
+
+    def _check_pipewire_recording(self) -> None:
+        process = self.pipewire_process
+        if not process or process.poll() is None or self.recording_state == "idle":
+            return
+        error = self._pipewire_error(process)
+        path = self.recording_path
+        self.pipewire_process = None
+        self.recording_state = "idle"
+        self.duration_timer.stop()
+        self.recording_path = None
+        self.recording_started_at = None
+        self.elapsed_before_pause = 0.0
+        self._refresh_controls()
+        if path:
+            path.unlink(missing_ok=True)
+        self.failed.emit(error)
 
     def close_recording(self) -> None:
         if self.recording_state != "idle":
@@ -1461,6 +1966,7 @@ class AudioSplitter(QMainWindow):
         page.setSpacing(10)
 
         tabs = QTabWidget()
+        self.tabs = tabs
         tabs.addTab(self._build_samples_page(), "Samples")
         splitter_page = QWidget()
         splitter_layout = QVBoxLayout(splitter_page)
@@ -1499,7 +2005,12 @@ class AudioSplitter(QMainWindow):
         self.progress_bar.setTextVisible(True)
         progress_layout.addWidget(self.progress_bar)
         progress_layout.addWidget(self.progress_label)
-        self.progress_panel.setVisible(False)
+        # Keep the progress area in the layout at all times. Only its contents
+        # are toggled so starting a split cannot move the stem cards or export
+        # controls vertically.
+        self.progress_panel.setFixedHeight(54)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
         splitter_layout.addWidget(self.progress_panel)
 
         stem_grid = QGridLayout()
@@ -1624,6 +2135,29 @@ class AudioSplitter(QMainWindow):
         files_layout.addWidget(self.actions_one_widget)
 
         self.actions_two_widget = self.actions_one_widget
+
+        self.library_actions_widget = QWidget()
+        library_actions = QHBoxLayout(self.library_actions_widget)
+        library_actions.setContentsMargins(0, 0, 0, 0)
+        self.new_library_folder_button = QPushButton("New Folder")
+        self.new_library_folder_button.clicked.connect(self._new_library_folder)
+        self.rename_library_folder_button = QPushButton("Rename")
+        self.rename_library_folder_button.clicked.connect(self._rename_library_folder)
+        self.delete_library_folder_button = QPushButton("Delete")
+        self.delete_library_folder_button.clicked.connect(self._delete_library_folder)
+        self.refresh_library_button = QPushButton("Refresh")
+        self.refresh_library_button.clicked.connect(self._refresh_library)
+        for button in (
+            self.new_library_folder_button,
+            self.rename_library_folder_button,
+            self.delete_library_folder_button,
+            self.refresh_library_button,
+        ):
+            library_actions.addWidget(button)
+        library_actions.addStretch()
+        self.library_actions_widget.setVisible(False)
+        files_layout.addWidget(self.library_actions_widget)
+
         self.samples_status = QLabel()
         files_layout.addWidget(self.samples_status)
         browser.addWidget(files)
@@ -1632,12 +2166,15 @@ class AudioSplitter(QMainWindow):
         browser.setSizes([280, 780])
         layout.addWidget(browser, 1)
 
-        self.preview_player = PreviewPlayer()
-        self.preview_player.setFixedHeight(145)
-        layout.addWidget(self.preview_player)
+        # The waveform editor is the only visible preview surface. Keep the
+        # player as a hidden engine for audio output and transport state.
+        self.preview_player = PreviewPlayer(page)
+        self.preview_player.setVisible(False)
         self.waveform_editor = WaveformEditor()
         self.waveform_editor.setFixedHeight(280)
         self.waveform_editor.set_preview_callback(self._preview_trim_range)
+        self.waveform_editor.playhead_requested.connect(self._seek_preview_from_waveform)
+        self.waveform_editor.split_requested.connect(self._split_current_sample)
         self.waveform_editor.working_file_changed.connect(self._working_preview_changed)
         self.waveform_editor.saved.connect(self._trim_saved)
         self.waveform_editor.play_button.clicked.connect(self._play_trim_selection)
@@ -1661,6 +2198,7 @@ class AudioSplitter(QMainWindow):
         self.scan_recursive_checkbox.setVisible(showing_explorer)
         self.actions_one_widget.setVisible(showing_explorer)
         self.actions_two_widget.setVisible(showing_explorer)
+        self.library_actions_widget.setVisible(not showing_explorer)
         self.add_reference_button.setVisible(showing_explorer)
         self.copy_library_button.setVisible(showing_explorer)
         self.add_folder_button.setVisible(showing_explorer)
@@ -1679,7 +2217,7 @@ class AudioSplitter(QMainWindow):
             self.folder_tree.setVisible(False)
             self.library_tree.setVisible(True)
             self._populate_library_tree()
-            self._show_references()
+            self._show_directory(self.sample_library.root)
 
     def _restore_samples_directory(self, path: Path) -> None:
         index = self.folder_model.index(str(path))
@@ -1696,18 +2234,31 @@ class AudioSplitter(QMainWindow):
 
     def _populate_library_tree(self) -> None:
         self.library_tree.clear()
+
+        library_root = QTreeWidgetItem(["Library"])
+        library_root.setData(0, Qt.ItemDataRole.UserRole, str(self.sample_library.root))
+        self.library_tree.addTopLevelItem(library_root)
+
+        def add_children(parent: QTreeWidgetItem, directory: Path) -> None:
+            try:
+                directories = sorted(
+                    (path for path in directory.iterdir() if path.is_dir()),
+                    key=lambda path: path.name.casefold(),
+                )
+            except OSError:
+                return
+            for child in directories:
+                item = QTreeWidgetItem([child.name])
+                item.setData(0, Qt.ItemDataRole.UserRole, str(child))
+                parent.addChild(item)
+                add_children(item, child)
+
+        add_children(library_root, self.sample_library.root)
         references = QTreeWidgetItem(["References"])
         references.setData(0, Qt.ItemDataRole.UserRole, "references")
         self.library_tree.addTopLevelItem(references)
-        for directory in (
-            self.sample_library.imported_dir,
-            self.sample_library.recorded_dir,
-            self.sample_library.trimmed_dir,
-        ):
-            item = QTreeWidgetItem([directory.name])
-            item.setData(0, Qt.ItemDataRole.UserRole, str(directory))
-            self.library_tree.addTopLevelItem(item)
-        self.library_tree.setCurrentItem(references)
+        self.library_tree.expandItem(library_root)
+        self.library_tree.setCurrentItem(library_root)
 
     def _library_tree_changed(self, item: QTreeWidgetItem, _column: int) -> None:
         value = item.data(0, Qt.ItemDataRole.UserRole)
@@ -1734,7 +2285,7 @@ class AudioSplitter(QMainWindow):
         if not path.is_dir():
             return
         self.current_samples_directory = path
-        self.samples_location_label.setVisible(not self.showing_library)
+        self.samples_location_label.setVisible(True)
         if not self.showing_library:
             self.last_explorer_directory = path
             self.sample_library.set_last_directory(path)
@@ -1774,10 +2325,11 @@ class AudioSplitter(QMainWindow):
 
     def _copy_selected_to_library(self) -> None:
         paths = self._selected_sample_paths()
-        copied = self.sample_library.copy_into_library(paths)
+        destination = self.current_samples_directory if self.showing_library else None
+        copied = self.sample_library.copy_into_library(paths, destination)
         self.samples_status.setText(f"Copied {len(copied)} file(s) into the library")
         if self.showing_library:
-            self._show_library()
+            self._refresh_library()
 
     def _folder_audio_paths(self) -> list[Path]:
         return self.sample_library.scan_folder(
@@ -1795,7 +2347,83 @@ class AudioSplitter(QMainWindow):
         copied = self.sample_library.copy_into_library(paths)
         self.samples_status.setText(f"Copied {len(copied)} folder file(s) into the library")
         if self.showing_library:
-            self._show_library()
+            self._refresh_library()
+
+    def _selected_library_directory(self) -> Path:
+        if self.showing_library and self.current_samples_directory:
+            path = self.current_samples_directory
+            if path.is_dir() and self.sample_library.is_library_path(path):
+                return path
+        return self.sample_library.root
+
+    def _library_folder_name(self, title: str, label: str, text: str = "") -> str | None:
+        name, accepted = QInputDialog.getText(self, title, label, text=text)
+        if not accepted:
+            return None
+        name = name.strip()
+        if not name or name in {".", ".."} or Path(name).name != name:
+            QMessageBox.warning(self, title, "Enter a single folder name without path separators.")
+            return None
+        return name
+
+    def _new_library_folder(self) -> None:
+        parent = self._selected_library_directory()
+        name = self._library_folder_name("New library folder", "Folder name:")
+        if not name:
+            return
+        destination = parent / name
+        if destination.exists():
+            QMessageBox.warning(self, "Folder already exists", f"A folder named {name!r} already exists here.")
+            return
+        try:
+            destination.mkdir()
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not create folder", str(exc))
+            return
+        self._refresh_library(destination)
+
+    def _rename_library_folder(self) -> None:
+        path = self._selected_library_directory()
+        name = self._library_folder_name("Rename library folder", "New folder name:", path.name)
+        if not name or name == path.name:
+            return
+        renamed = self.sample_library.rename_library_directory(path, name)
+        if renamed is None:
+            QMessageBox.warning(
+                self,
+                "Folder cannot be renamed",
+                "Only user-created library folders can be renamed, and the destination name must be unused.",
+            )
+            return
+        self._refresh_library(renamed)
+
+    def _delete_library_folder(self) -> None:
+        path = self._selected_library_directory()
+        if path.resolve() in self.sample_library.protected_directories() or path.resolve() == self.sample_library.root.resolve():
+            QMessageBox.warning(self, "Folder cannot be deleted", "StemKart's root and system folders are protected.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete empty folder?",
+            f"Delete the empty folder {path.name!r}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self.sample_library.remove_library_directory(path):
+            QMessageBox.warning(self, "Folder not deleted", "Only empty library folders can be deleted.")
+            return
+        self._refresh_library(self.sample_library.root)
+
+    def _refresh_library(self, selected: Path | None = None) -> None:
+        if not self.showing_library:
+            return
+        self.sample_library.sync_legacy_additions()
+        selected = selected or self.current_samples_directory or self.sample_library.root
+        if not selected.is_dir() or not self.sample_library.is_library_path(selected):
+            selected = self.sample_library.root
+        self._populate_library_tree()
+        self._show_directory(selected)
 
     def _recording_saved(self, path: Path) -> None:
         self.sample_library.add_recorded(path)
@@ -1811,6 +2439,16 @@ class AudioSplitter(QMainWindow):
 
     def _preview_trim_range(self, start_ms: int, end_ms: int) -> None:
         self.preview_player.play_selection(start_ms, end_ms)
+
+    def _seek_preview_from_waveform(self, position_ms: int) -> None:
+        self.preview_player.seek_absolute(position_ms)
+
+    def _split_current_sample(self, path: Path) -> None:
+        if not path.exists():
+            return
+        self.set_source(path)
+        self.tabs.setCurrentIndex(1)
+        self.split_track()
 
     def _sync_trim_playback_range(self) -> None:
         if self.waveform_editor.samples.size:
@@ -1851,6 +2489,10 @@ class AudioSplitter(QMainWindow):
             self._populate_library_tree()
             self._show_directory(self.sample_library.trimmed_dir)
 
+    def _set_split_progress_visible(self, visible: bool) -> None:
+        self.progress_bar.setVisible(visible)
+        self.progress_label.setVisible(visible)
+
     def choose_track(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "Choose a music track", "", SUPPORTED_AUDIO)
         if filename:
@@ -1861,7 +2503,7 @@ class AudioSplitter(QMainWindow):
         self.file_label.setText(path.name)
         self.file_label.setToolTip(str(path))
         self.split_button.setEnabled(True)
-        self.progress_panel.setVisible(False)
+        self._set_split_progress_visible(False)
         self.statusBar().clearMessage()
         for card in self.cards.values():
             card.reset()
@@ -1881,7 +2523,7 @@ class AudioSplitter(QMainWindow):
         self.choose_button.setEnabled(False)
         self.progress_label.setText("Preparing split...")
         self.progress_bar.setRange(0, 0)
-        self.progress_panel.setVisible(True)
+        self._set_split_progress_visible(True)
         output_dir = Path(tempfile.mkdtemp(prefix="demucs-", dir=self.temp_root))
         self.split_thread = SplitThread(self.source_path, output_dir)
         self.split_thread.progress.connect(self._split_progress)
@@ -1892,7 +2534,7 @@ class AudioSplitter(QMainWindow):
 
     @pyqtSlot(int, str)
     def _split_progress(self, percent: int, message: str) -> None:
-        self.progress_panel.setVisible(True)
+        self._set_split_progress_visible(True)
         if percent < 0:
             self.progress_bar.setRange(0, 0)
         else:
@@ -1919,7 +2561,7 @@ class AudioSplitter(QMainWindow):
         loaded = sum(card.file_path is not None for card in self.cards.values())
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
-        self.progress_panel.setVisible(False)
+        self._set_split_progress_visible(False)
         if loaded:
             self.statusBar().clearMessage()
             self.named_export_button.setEnabled(True)
@@ -1930,7 +2572,7 @@ class AudioSplitter(QMainWindow):
 
     @pyqtSlot(str)
     def _split_failed(self, message: str) -> None:
-        self.progress_panel.setVisible(False)
+        self._set_split_progress_visible(False)
         self.statusBar().showMessage("Split failed")
         QMessageBox.critical(self, "Could not split track", message)
 
