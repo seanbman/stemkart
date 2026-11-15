@@ -21,6 +21,10 @@ stemkart = "main:main"
 [tool.setuptools]
 py-modules = ["main"]
 
+[tool.setuptools.data-files]
+"share/stemkart/icons" = ["icons/*.svg"]
+"share/stemkart/fonts" = ["fonts/*.ttf", "fonts/*.txt"]
+
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"

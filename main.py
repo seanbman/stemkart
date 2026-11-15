@@ -14,35 +14,56 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
-from PyQt6.QtCore import QFile, QDir, QIODevice, QThread, QTimer, QUrl, Qt, QSize, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFileSystemModel, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtCore import QFile, QDir, QEvent, QIODevice, QFileInfo, QThread, QTimer, QUrl, Qt, QSize, QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import (
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QFileSystemModel,
+    QFont,
+    QFontDatabase,
+    QIcon,
+    QPainter,
+    QPalette,
+    QPen,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
+    QFileIconProvider,
     QGridLayout,
+    QGraphicsDropShadowEffect,
     QFrame,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProxyStyle,
     QPushButton,
     QSlider,
     QStyle,
+    QStyleOption,
     QSizePolicy,
+    QSizeGrip,
     QTabWidget,
     QListWidget,
     QListWidgetItem,
     QSplitter,
+    QToolButton,
     QTreeView,
     QTreeWidget,
     QTreeWidgetItem,
@@ -62,8 +83,20 @@ SUPPORTED_SUFFIXES = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac", ".opus"}
 def resource_path(*parts: str) -> Path:
     """Return a path to a read-only resource shipped with the application."""
     frozen_root = getattr(sys, "_MEIPASS", None)
-    root = Path(frozen_root) if frozen_root else Path(__file__).resolve().parent
-    return root.joinpath(*parts)
+    roots = []
+    if frozen_root:
+        roots.append(Path(frozen_root))
+    roots.extend(
+        (
+            Path(__file__).resolve().parent,
+            Path(sys.prefix) / "share" / APP_SLUG,
+        )
+    )
+    for root in roots:
+        candidate = root.joinpath(*parts)
+        if candidate.exists():
+            return candidate
+    return roots[0].joinpath(*parts)
 
 
 def _xdg_base(environment_name: str, fallback: str) -> Path:
@@ -79,12 +112,221 @@ def app_config_dir() -> Path:
     return _xdg_base("XDG_CONFIG_HOME", ".config") / APP_SLUG
 
 
+def app_settings_path() -> Path:
+    return app_config_dir() / "settings.json"
+
+
+def load_app_settings() -> dict[str, object]:
+    try:
+        settings = json.loads(app_settings_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def save_app_setting(name: str, value: object) -> None:
+    path = app_settings_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        settings = load_app_settings()
+        settings[name] = value
+        path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        # The UI should remain usable if the settings location is read-only.
+        pass
+
+
 def app_cache_dir() -> Path:
     return _xdg_base("XDG_CACHE_HOME", ".cache") / APP_SLUG
 
 
 def bundled_icon(name: str) -> QIcon:
     return QIcon(str(resource_path("icons", name)))
+
+
+def tinted_icon(icon: QIcon, color: str, size: int = 16) -> QIcon:
+    """Keep an existing icon shape while replacing its visible pixels with one color."""
+    pixmap = icon.pixmap(QSize(size, size))
+    if pixmap.isNull():
+        return icon
+    monochrome = QPixmap(pixmap.size())
+    monochrome.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(monochrome)
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+    painter.fillRect(monochrome.rect(), QColor(color))
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+    painter.drawPixmap(0, 0, pixmap)
+    painter.end()
+    tinted = QIcon()
+    for mode in (
+        QIcon.Mode.Normal,
+        QIcon.Mode.Disabled,
+        QIcon.Mode.Active,
+        QIcon.Mode.Selected,
+    ):
+        tinted.addPixmap(monochrome, mode)
+    return tinted
+
+
+class ThemedIconButton(QPushButton):
+    """An icon button whose glyph follows the button's hover/pressed state."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("transportButton")
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setProperty("stemkart_active", False)
+        self._stemkart_base_icon = QIcon()
+        self.toggled.connect(self._update_icon_color)
+
+    def setIcon(self, icon: QIcon) -> None:
+        self._stemkart_base_icon = icon
+        self._update_icon_color()
+
+    def _update_icon_color(self) -> None:
+        if self._stemkart_base_icon.isNull():
+            super().setIcon(QIcon())
+            return
+        application = QApplication.instance()
+        light_mode = bool(getattr(application, "_stemkart_light_mode", False))
+        normal_color = "#000000" if light_mode else "#ffffff"
+        highlighted_color = "#ffffff" if light_mode else "#000000"
+        active = self.underMouse() or self.isDown() or self.isChecked()
+        if self.property("stemkart_active") != active:
+            self.setProperty("stemkart_active", active)
+            if self.style() is not None:
+                self.style().unpolish(self)
+                self.style().polish(self)
+        color = highlighted_color if active else normal_color
+        size = max(16, self.iconSize().width(), self.iconSize().height())
+        super().setIcon(tinted_icon(self._stemkart_base_icon, color, size=size))
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        self._update_icon_color()
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self._update_icon_color()
+
+    def mousePressEvent(self, event) -> None:
+        super().mousePressEvent(event)
+        self._update_icon_color()
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        self._update_icon_color()
+
+
+class ThemedTextButton(QPushButton):
+    """A text button with the same explicit retro hover state as icon buttons."""
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setObjectName("markerButton")
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setProperty("stemkart_active", False)
+        self.toggled.connect(self._update_active_state)
+
+    def _update_active_state(self) -> None:
+        active = self.underMouse() or self.isDown() or self.isChecked()
+        if self.property("stemkart_active") == active:
+            return
+        self.setProperty("stemkart_active", active)
+        if self.style() is not None:
+            self.style().unpolish(self)
+            self.style().polish(self)
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        self._update_active_state()
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self._update_active_state()
+
+    def mousePressEvent(self, event) -> None:
+        super().mousePressEvent(event)
+        self._update_active_state()
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        self._update_active_state()
+
+
+class StemKartSizeGrip(QSizeGrip):
+    """A minimal resize affordance without Qt's filled corner square."""
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        pen = QPen(self.palette().text().color())
+        pen.setWidth(1)
+        painter.setPen(pen)
+        edge = min(self.width(), self.height()) - 1
+        for offset in (4, 8, 12):
+            painter.drawLine(edge - offset, edge, edge, edge - offset)
+
+
+class MonochromeIconProvider(QFileIconProvider):
+    """Keep filesystem folder and file icons consistent with StemKart's UI."""
+
+    def __init__(self, color: str = "#ffffff") -> None:
+        super().__init__()
+        self.folder_icon = QIcon(str(resource_path("icons", "folder.svg")))
+        self.file_icon = QIcon(str(resource_path("icons", "file.svg")))
+        if color.casefold() != "#ffffff":
+            self.folder_icon = tinted_icon(self.folder_icon, color)
+            self.file_icon = tinted_icon(self.file_icon, color)
+
+    def icon(self, value):
+        if value == QFileIconProvider.IconType.Folder:
+            return self.folder_icon
+        if value == QFileIconProvider.IconType.File:
+            return self.file_icon
+        if isinstance(value, QFileInfo) and value.isDir():
+            return self.folder_icon
+        if isinstance(value, QFileInfo):
+            return self.file_icon
+        if isinstance(value, QFileIconProvider.IconType):
+            return self.file_icon
+        return super().icon(value)
+
+
+class OrangeBranchStyle(QProxyStyle):
+    """Use the orange accent for every folder-tree expand arrow."""
+
+    def __init__(self) -> None:
+        super().__init__("Fusion")
+
+    def drawPrimitive(self, element, option, painter, widget=None) -> None:
+        if element == QStyle.PrimitiveElement.PE_IndicatorBranch:
+            selected_option = QStyleOption(option)
+            for role in (
+                QPalette.ColorRole.Text,
+                QPalette.ColorRole.WindowText,
+                QPalette.ColorRole.ButtonText,
+                QPalette.ColorRole.HighlightedText,
+                QPalette.ColorRole.Dark,
+                QPalette.ColorRole.Mid,
+            ):
+                selected_option.palette.setColor(role, QColor("#ff7a00"))
+            option = selected_option
+        super().drawPrimitive(element, option, painter, widget)
+
+
+def load_bundled_font() -> str:
+    """Load the bundled IBM Plex Sans faces and return their family name."""
+    family = "IBM Plex Sans"
+    for weight in ("Regular", "Medium", "Bold"):
+        font_id = QFontDatabase.addApplicationFont(
+            str(resource_path("fonts", f"IBMPlexSans-{weight}.ttf"))
+        )
+        if font_id >= 0:
+            families = QFontDatabase.applicationFontFamilies(font_id)
+            if families:
+                family = families[0]
+    return family
 
 
 def pretty_name(value: str) -> str:
@@ -173,7 +415,11 @@ def format_time(milliseconds: int) -> str:
 
 
 def is_audio_file(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+    return (
+        path.is_file()
+        and not path.name.startswith("._")
+        and path.suffix.lower() in SUPPORTED_SUFFIXES
+    )
 
 
 class SampleLibrary:
@@ -390,7 +636,7 @@ class SampleLibrary:
         self.save()
         return destination
 
-    def remove_library_directory(self, path: Path) -> bool:
+    def remove_library_directory(self, path: Path, recursive: bool = False) -> bool:
         resolved = path.resolve()
         if (
             not path.is_dir()
@@ -400,10 +646,42 @@ class SampleLibrary:
         ):
             return False
         try:
-            path.rmdir()
+            if recursive:
+                shutil.rmtree(path)
+            else:
+                path.rmdir()
         except OSError:
             return False
+        removed_prefix = resolved
+        for key, record in list(self.entries.items()):
+            if not isinstance(record, dict):
+                continue
+            value = record.get("path")
+            if not isinstance(value, str):
+                continue
+            try:
+                Path(value).resolve().relative_to(removed_prefix)
+            except ValueError:
+                continue
+            self.entries.pop(key, None)
+        self.save()
         return True
+
+    def remove_library_files(self, paths: list[Path]) -> list[Path]:
+        deleted: list[Path] = []
+        for path in paths:
+            resolved = path.resolve()
+            if not path.is_file() or not self.is_library_path(path):
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            deleted.append(resolved)
+            self.entries.pop(str(resolved), None)
+        if deleted:
+            self.save()
+        return deleted
 
     def add_trimmed(self, path: Path) -> None:
         self._record(path, "managed")
@@ -413,11 +691,31 @@ class SampleLibrary:
         self._record(path, "recorded")
         self.save()
 
-    def scan_folder(self, folder: Path, recursive: bool) -> list[Path]:
+    def scan_folder(
+        self,
+        folder: Path,
+        recursive: bool,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> list[Path]:
         if not folder.is_dir():
             return []
-        paths = folder.rglob("*") if recursive else folder.iterdir()
-        return sorted((path for path in paths if is_audio_file(path)), key=lambda path: path.name.casefold())
+        try:
+            if not recursive:
+                return sorted(
+                    (path for path in folder.iterdir() if is_audio_file(path)),
+                    key=lambda path: path.name.casefold(),
+                )
+            audio_paths: list[Path] = []
+            for root, _directories, filenames in os.walk(folder, followlinks=False):
+                if should_stop and should_stop():
+                    return []
+                root_path = Path(root)
+                audio_paths.extend(
+                    path for path in (root_path / name for name in filenames) if is_audio_file(path)
+                )
+            return sorted(audio_paths, key=lambda path: path.name.casefold())
+        except OSError:
+            return []
 
     def library_files(self) -> list[Path]:
         paths: list[Path] = []
@@ -438,6 +736,28 @@ class SampleLibrary:
             if path.suffix.lower() in SUPPORTED_SUFFIXES:
                 paths.append(path)
         return sorted(set(paths), key=lambda path: path.name.casefold())
+
+
+class FolderScanWorker(QObject):
+    completed = pyqtSignal(object, int)
+
+    def __init__(self, library: SampleLibrary, folder: Path, recursive: bool, generation: int) -> None:
+        super().__init__()
+        self.library = library
+        self.folder = folder
+        self.recursive = recursive
+        self.generation = generation
+
+    @pyqtSlot()
+    def run(self) -> None:
+        self.completed.emit(
+            self.library.scan_folder(
+                self.folder,
+                self.recursive,
+                should_stop=lambda: QThread.currentThread().isInterruptionRequested(),
+            ),
+            self.generation,
+        )
 
 
 class SplitThread(QThread):
@@ -597,7 +917,7 @@ class StemCard(QGroupBox):
         self._set_controls_enabled(False)
 
     def _icon_button(self, name: str, standard_icon: QStyle.StandardPixmap) -> QPushButton:
-        button = QPushButton()
+        button = ThemedIconButton()
         button.setFixedSize(30, 30)
         button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         button.setIcon(self.style().standardIcon(standard_icon))
@@ -623,14 +943,20 @@ class StemCard(QGroupBox):
     def set_file(self, path: Path | None) -> None:
         self.player.stop()
         self.file_path = path
-        enabled = path is not None and path.exists()
+        availability = wav_availability(path) if path is not None and path.exists() else "unavailable"
+        enabled = availability == "usable"
         self.position_slider.setRange(0, 0)
         self.position_label.setText("0:00")
         self.duration_label.setText("0:00")
         if enabled:
             self.player.setSource(QUrl.fromLocalFile(str(path)))
             self.status.setText(path.name)
+        elif availability == "empty":
+            self.file_path = None
+            self.player.setSource(QUrl())
+            self.status.setText("No audible content")
         else:
+            self.file_path = None
             self.player.setSource(QUrl())
             self.status.setText("Unavailable")
         self._set_controls_enabled(enabled)
@@ -768,7 +1094,7 @@ class PreviewPlayer(QGroupBox):
         self._set_controls_enabled(False)
 
     def _icon_button(self, name: str, standard_icon: QStyle.StandardPixmap) -> QPushButton:
-        button = QPushButton()
+        button = ThemedIconButton()
         button.setFixedSize(30, 30)
         button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         button.setIcon(self.style().standardIcon(standard_icon))
@@ -1068,47 +1394,60 @@ class WaveformWidget(QWidget):
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), self.palette().base())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        background = self.palette().base().color()
+        foreground = self.palette().text().color()
+        painter.fillRect(self.rect(), background)
         if not self.samples.size:
-            painter.setPen(self.palette().text().color())
+            painter.setPen(foreground)
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Select an audio file to load its waveform")
             return
 
-        width = max(1, self.width())
-        height = self.height()
+        # Keep every painted pixel inside the widget. In particular, drawing a
+        # thick line at ``width`` or ``height`` lets Qt's pen extend into the
+        # neighboring layout and produces a stray vertical edge.
+        plot_rect = self.rect().adjusted(1, 1, -1, -1)
+        if plot_rect.width() < 1 or plot_rect.height() < 1:
+            return
+        painter.save()
+        painter.setClipRect(plot_rect)
+        width = plot_rect.width()
+        height = plot_rect.height()
         view_ratio = max(0.001, self.view_end_ratio - self.view_start_ratio)
         selected_left = round((self.start_ratio - self.view_start_ratio) / view_ratio * width)
         selected_right = round((self.end_ratio - self.view_start_ratio) / view_ratio * width)
-        selected_left = max(0, min(width, selected_left))
-        selected_right = max(0, min(width, selected_right))
-        painter.fillRect(selected_left, 0, selected_right - selected_left, height, QColor(220, 235, 250))
+        selected_left = max(0, min(width - 1, selected_left))
+        selected_right = max(0, min(width - 1, selected_right))
         view_start = round(self.view_start_ratio * len(self.samples))
         view_end = max(view_start + 1, round(self.view_end_ratio * len(self.samples)))
         view_length = view_end - view_start
         bin_size = max(1, view_length // width)
-        pen = QPen(self.palette().highlight().color())
-        painter.setPen(pen)
-        center = height // 2
-        for x in range(width):
-            start = min(view_end, view_start + x * bin_size)
-            end = min(len(self.samples), start + bin_size)
-            if start >= end:
-                break
-            peak = float(np.max(np.abs(self.samples[start:end])))
-            half_height = max(1, round(peak * (height // 2 - 4)))
-            painter.drawLine(x, center - half_height, x, center + half_height)
-        marker_color = QColor(0, 0, 0)
-        painter.setPen(QPen(marker_color, 2))
-        painter.drawLine(selected_left, 0, selected_left, height)
-        painter.setPen(QPen(marker_color, 2))
-        painter.drawLine(selected_right, 0, selected_right, height)
+        center = plot_rect.top() + height // 2
+        waveform_color = QColor("#ff7a00")
+        visible_samples = np.abs(self.samples[view_start:view_end])
+        column_count = min(width, len(visible_samples) // bin_size)
+        if column_count:
+            peaks = visible_samples[: column_count * bin_size].reshape(column_count, bin_size).max(axis=1)
+            painter.setPen(QPen(waveform_color))
+            for x, peak in enumerate(peaks):
+                half_height = max(1, round(float(peak) * (height // 2 - 4)))
+                painter.drawLine(
+                    plot_rect.left() + x,
+                    center - half_height,
+                    plot_rect.left() + x,
+                    center + half_height,
+                )
+        painter.setPen(QPen(foreground, 2))
+        painter.drawLine(plot_rect.left() + selected_left, plot_rect.top(), plot_rect.left() + selected_left, plot_rect.bottom())
+        painter.drawLine(plot_rect.left() + selected_right, plot_rect.top(), plot_rect.left() + selected_right, plot_rect.bottom())
         if self.playhead_ratio is not None and self.view_start_ratio <= self.playhead_ratio <= self.view_end_ratio:
             playhead_x = round(
                 (self.playhead_ratio - self.view_start_ratio) / view_ratio * width
             )
-            painter.setPen(QPen(QColor(220, 40, 40), 3))
-            painter.drawLine(playhead_x, 0, playhead_x, height)
+            playhead_x = max(0, min(width - 1, playhead_x))
+            painter.setPen(QPen(QColor("#ff0000"), 2))
+            painter.drawLine(plot_rect.left() + playhead_x, plot_rect.top(), plot_rect.left() + playhead_x, plot_rect.bottom())
+        painter.restore()
 
 
 class WaveformEditor(QGroupBox):
@@ -1119,6 +1458,7 @@ class WaveformEditor(QGroupBox):
 
     def __init__(self) -> None:
         super().__init__("")
+        self.setObjectName("sampleTrimmingContainer")
         self.file_path: Path | None = None
         self.samples = np.array([], dtype=np.float32)
         self.sample_rate = 44100
@@ -1142,16 +1482,22 @@ class WaveformEditor(QGroupBox):
         controls.setSpacing(3)
         controls.setContentsMargins(0, 0, 0, 0)
         self.range_label = QLabel("Full file")
-        self.range_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        self.range_label.setFixedWidth(106)
+        self.range_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         controls.addWidget(self.range_label)
-        self.set_start_button = QPushButton("Set Start")
+        self.set_start_button = ThemedTextButton("Set Start")
         self.set_start_button.setToolTip("Set the start marker to the current playhead position")
         self.set_start_button.clicked.connect(self._set_start_from_playhead)
         controls.addWidget(self.set_start_button)
-        self.set_end_button = QPushButton("Set End")
+        self.set_end_button = ThemedTextButton("Set End")
         self.set_end_button.setToolTip("Set the end marker to the current playhead position")
         self.set_end_button.clicked.connect(self._set_end_from_playhead)
         controls.addWidget(self.set_end_button)
+        self.playback_time_label = QLabel("0:00 - 0:00")
+        self.playback_time_label.setFixedWidth(106)
+        self.playback_time_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.playback_time_label.setToolTip("Current playback position and total duration")
+        controls.addWidget(self.playback_time_label)
         controls.addStretch()
         self.play_button = self._icon_button("Play", QStyle.StandardPixmap.SP_MediaPlay)
         self.play_button.setIcon(self._editor_icon("play"))
@@ -1207,7 +1553,7 @@ class WaveformEditor(QGroupBox):
         self._set_action_state(False)
 
     def _icon_button(self, name: str, standard_icon: QStyle.StandardPixmap) -> QPushButton:
-        button = QPushButton()
+        button = ThemedIconButton()
         button.setFixedSize(30, 30)
         button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         button.setIcon(self.style().standardIcon(standard_icon))
@@ -1271,6 +1617,7 @@ class WaveformEditor(QGroupBox):
 
     def set_playhead(self, position_ms: int, duration_ms: int) -> None:
         self.waveform.set_playhead(position_ms, duration_ms)
+        self.playback_time_label.setText(f"{format_time(position_ms)} - {format_time(duration_ms)}")
         self._set_action_state(bool(self.samples.size))
 
     def _set_start_from_playhead(self) -> None:
@@ -1282,15 +1629,13 @@ class WaveformEditor(QGroupBox):
     def _confirm_split_sample(self) -> None:
         if not self.samples.size:
             return
-        dialog = QMessageBox(self)
-        dialog.setIcon(QMessageBox.Icon.Question)
-        dialog.setWindowTitle("Split sample")
-        dialog.setText("Split the current sample into stems now?")
-        split_button = dialog.addButton("Split sample", QMessageBox.ButtonRole.AcceptRole)
-        dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        dialog.setDefaultButton(split_button)
-        dialog.exec()
-        if dialog.clickedButton() == split_button:
+        if ask_confirmation(
+            self,
+            "Split sample",
+            "Split the current sample into stems now?",
+            accept_label="Split sample",
+            reject_label="Cancel",
+        ):
             self.split_requested.emit(self._write_split_source())
 
     def _waveform_playhead_requested(self, position_ms: int) -> None:
@@ -1311,6 +1656,7 @@ class WaveformEditor(QGroupBox):
         self.working_name = self.file_path.name if self.file_path else ""
         self.undo_state = None
         self.waveform.set_samples(self.samples, self.sample_rate)
+        self.playback_time_label.setText("0:00 - 0:00")
         self._set_action_state(False)
         if not self.file_path:
             self.file_label.clear()
@@ -1418,8 +1764,8 @@ class WaveformEditor(QGroupBox):
             return
         default_name = self.working_name if self.working_name == "untitled.wav" else f"{self.file_path.stem}-trimmed.wav"
         default = app_data_dir() / "samples" / "trimmed" / default_name
-        destination, _ = QFileDialog.getSaveFileName(self, "Save trimmed sample", str(default), "WAV files (*.wav)")
-        if not destination:
+        destination = choose_save_path(self, "Save trimmed sample", default, "WAV files (*.wav)")
+        if destination is None or not confirm_overwrite(self, Path(destination)):
             return
         start, end = self.waveform.range_samples()
         rendered = np.clip(self.samples[start:end], -1.0, 1.0)
@@ -1431,7 +1777,7 @@ class WaveformEditor(QGroupBox):
                 output.setframerate(self.sample_rate)
                 output.writeframes(pcm)
         except OSError as exc:
-            QMessageBox.critical(self, "Could not save sample", str(exc))
+            show_message(self, "Could not save sample", str(exc))
             return
         self.saved.emit(Path(destination))
 
@@ -1548,12 +1894,15 @@ class RecordingPanel(QWidget):
         self.elapsed_before_pause = 0.0
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(8, 0, 8, 0)
         layout.setSpacing(4)
 
         self.input_combo = QComboBox()
         self.input_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.input_combo.setToolTip("Sound source")
+        self.input_combo.setFixedHeight(30)
+        self.input_combo.setToolTip(
+            "Choose a physical input, system output, or active application stream"
+        )
         layout.addWidget(self.input_combo, 1)
 
         self.refresh_button = QPushButton("↻")
@@ -1584,11 +1933,15 @@ class RecordingPanel(QWidget):
         self.duration_timer.setInterval(100)
         self.duration_timer.timeout.connect(self._update_duration)
         self.duration_timer.timeout.connect(self._check_pipewire_recording)
+        self.device_refresh_timer = QTimer(self)
+        self.device_refresh_timer.setInterval(2000)
+        self.device_refresh_timer.timeout.connect(self._refresh_devices)
+        self.device_refresh_timer.start()
         self._refresh_devices()
         self._refresh_controls()
 
     def _icon_button(self, name: str, icon_name: str) -> QPushButton:
-        button = QPushButton()
+        button = ThemedIconButton()
         button.setFixedSize(30, 30)
         button.setIcon(bundled_icon(icon_name))
         button.setIconSize(QSize(18, 18))
@@ -1599,6 +1952,7 @@ class RecordingPanel(QWidget):
     def _refresh_devices(self) -> None:
         if self.recording_state != "idle":
             return
+        selected_label = self.input_combo.currentText()
         self.input_combo.clear()
         self.targets = []
         devices = QMediaDevices.audioInputs()
@@ -1616,7 +1970,15 @@ class RecordingPanel(QWidget):
             self.input_combo.addItem(target.label)
 
         if self.targets:
-            self.input_combo.setCurrentIndex(default_target_index)
+            selected_index = next(
+                (
+                    index
+                    for index in range(self.input_combo.count())
+                    if self.input_combo.itemText(index) == selected_label
+                ),
+                default_target_index,
+            )
+            self.input_combo.setCurrentIndex(selected_index)
         else:
             self.input_combo.addItem("No audio sources available")
 
@@ -1719,7 +2081,11 @@ class RecordingPanel(QWidget):
             self.failed.emit("The selected PipeWire source has no usable node.")
             return
         path = self._next_path()
-        target_argument = "0" if target.kind == "pipewire_app" else str(target.node_id)
+        # A sink is not itself a capture source.  Passing its node id to
+        # pw-record causes PipeWire to fall back to the default source on
+        # some installations.  Create an unlinked recorder stream and link
+        # it explicitly to the selected node's output/monitor ports below.
+        target_argument = "0"
         command = [
             "pw-record",
             "--target",
@@ -1744,7 +2110,7 @@ class RecordingPanel(QWidget):
             self.failed.emit(f"Could not start PipeWire recording: {exc}")
             return
 
-        if target.kind == "pipewire_app":
+        if target.kind in {"pipewire_app", "pipewire_sink"}:
             error = self._link_pipewire_application(process, target.node_id)
             if error:
                 self._finish_pipewire_process(process)
@@ -1939,8 +2305,268 @@ class RecordingPanel(QWidget):
             self.stop_recording()
 
 
+class DarkTitleBar(QWidget):
+    """A black client-side title bar with native window actions."""
+
+    def __init__(self, window: QWidget, dialog: bool = False) -> None:
+        super().__init__(window)
+        self.window = window
+        self.dialog = dialog
+        self.setObjectName("titleBar")
+        self.setFixedHeight(36)
+
+        layout = QGridLayout(self)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setHorizontalSpacing(2)
+        layout.setColumnMinimumWidth(0, 0 if dialog else 86)
+        layout.setColumnMinimumWidth(2, 34 if dialog else 116)
+        layout.setColumnStretch(1, 1)
+
+        title = QLabel(window.windowTitle() or APP_NAME)
+        title.setObjectName("titleBarTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title, 0, 1)
+
+        buttons = QWidget()
+        buttons.setObjectName("titleBarButtons")
+        buttons_layout = QHBoxLayout(buttons)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        buttons_layout.setSpacing(2)
+        actions = (
+            (("×", "Close", self.window.close),)
+            if dialog
+            else (
+                ("◐", "Toggle light mode", self.window.toggle_theme),
+                ("—", "Minimize", self.window.showMinimized),
+                ("□", "Maximize", self.window.toggle_maximized),
+                ("×", "Close", self.window.close),
+            )
+        )
+        for label, name, callback in actions:
+            button = QPushButton(label)
+            button.setObjectName("windowButton")
+            button.setFixedSize(26, 26)
+            button.setToolTip(name)
+            button.setAccessibleName(name)
+            button.clicked.connect(callback)
+            buttons_layout.addWidget(button)
+        layout.addWidget(buttons, 0, 2, alignment=Qt.AlignmentFlag.AlignRight)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            window_handle = self.window.windowHandle()
+            if window_handle is not None:
+                window_handle.startSystemMove()
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and not self.dialog:
+            self.window.toggle_maximized()
+        super().mouseDoubleClickEvent(event)
+
+
+class StemKartMessageDialog(QDialog):
+    """A deliberately simple message dialog with no platform-owned artwork."""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        title: str,
+        message: str,
+        buttons: tuple[str, ...],
+        accept_label: str | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        application = QApplication.instance()
+        surface_color = (
+            application.palette().window().color().name()
+            if application is not None
+            else "#000000"
+        )
+        surface = QFrame()
+        surface.setObjectName("dialogSurface")
+        surface.setStyleSheet(
+            f"QFrame#dialogSurface {{ background: {surface_color}; border: none; }}"
+        )
+        surface_layout = QVBoxLayout(surface)
+        surface_layout.setContentsMargins(0, 0, 8, 8)
+        surface_layout.setSpacing(0)
+
+        frame = QFrame()
+        frame.setObjectName("retroWindowFrame")
+        frame.setStyleSheet(
+            "QFrame#retroWindowFrame { border: 2px solid #ff7a00; }"
+        )
+        shadow = QGraphicsDropShadowEffect(frame)
+        shadow.setBlurRadius(0)
+        shadow.setOffset(4, 4)
+        shadow.setColor(QColor("#8a3d00"))
+        frame.setGraphicsEffect(shadow)
+        frame_layout = QVBoxLayout(frame)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+        frame_layout.setSpacing(0)
+        frame_layout.addWidget(DarkTitleBar(self, dialog=True))
+        surface_layout.addWidget(frame)
+        layout.addWidget(surface)
+
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(24, 16, 24, 14)
+        body_layout.setSpacing(16)
+        message_label = QLabel(message)
+        message_label.setWordWrap(True)
+        message_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        body_layout.addWidget(message_label)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        self._buttons: dict[str, QPushButton] = {}
+        for label in buttons:
+            button = QPushButton(label)
+            button.setMinimumWidth(76)
+            button.clicked.connect(self.accept if label == accept_label else self.reject)
+            button_row.addWidget(button)
+            self._buttons[label] = button
+        body_layout.addLayout(button_row)
+        frame_layout.addWidget(body)
+        self.adjustSize()
+        self.resize(max(self.width(), 420), self.height())
+        if accept_label and accept_label in self._buttons:
+            self._buttons[accept_label].setDefault(True)
+
+
+def show_message(parent: QWidget, title: str, message: str) -> None:
+    StemKartMessageDialog(parent, title, message, ("OK",), accept_label="OK").exec()
+
+
+def ask_confirmation(
+    parent: QWidget,
+    title: str,
+    message: str,
+    accept_label: str = "Yes",
+    reject_label: str = "No",
+) -> bool:
+    dialog = StemKartMessageDialog(
+        parent,
+        title,
+        message,
+        (reject_label, accept_label),
+        accept_label=accept_label,
+    )
+    return dialog.exec() == QDialog.DialogCode.Accepted
+
+
+def normalize_message_box(dialog: QMessageBox) -> None:
+    """Remove platform-specific message and button icons from a message box."""
+    dialog.setIcon(QMessageBox.Icon.NoIcon)
+    for label in dialog.findChildren(QLabel):
+        label.setWordWrap(True)
+    for button in dialog.buttons():
+        button.setIcon(QIcon())
+
+
+def style_dialog(dialog: QDialog) -> None:
+    """Give every Qt dialog the same black client-side chrome as the main window."""
+    if getattr(dialog, "_stemkart_title_bar", None) is not None:
+        return
+
+    dialog.setWindowFlags(dialog.windowFlags() | Qt.WindowType.FramelessWindowHint)
+    dialog.setSizeGripEnabled(False)
+    minimum_width = 300
+    if isinstance(dialog, QMessageBox):
+        minimum_width = 420
+        normalize_message_box(dialog)
+    elif isinstance(dialog, QInputDialog):
+        minimum_width = 360
+    dialog.setMinimumWidth(max(minimum_width, dialog.minimumWidth()))
+    layout = dialog.layout()
+    if layout is not None:
+        margins = layout.contentsMargins()
+        layout.setContentsMargins(
+            margins.left(),
+            margins.top() + 36,
+            margins.right(),
+            margins.bottom(),
+        )
+    title_bar = DarkTitleBar(dialog, dialog=True)
+    dialog._stemkart_title_bar = title_bar
+    if isinstance(dialog, QFileDialog):
+        application = QApplication.instance()
+        foreground = application.palette().text().color().name() if application else "#ffffff"
+        icon_provider = MonochromeIconProvider(foreground)
+        dialog.setIconProvider(icon_provider)
+        dialog._stemkart_file_icon_provider = icon_provider
+        for button in dialog.findChildren(QToolButton):
+            if not button.icon().isNull():
+                button.setIcon(tinted_icon(button.icon(), foreground))
+    dialog.adjustSize()
+    dialog.resize(max(dialog.width(), minimum_width), dialog.height())
+    title_bar.setGeometry(0, 0, dialog.width(), 36)
+    title_bar.raise_()
+
+
+def choose_save_path(parent: QWidget, title: str, default: Path, file_filter: str) -> str | None:
+    """Show a themed save dialog without Qt's platform overwrite prompt."""
+    dialog = QFileDialog(parent, title, str(default), file_filter)
+    dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+    dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+    dialog.setOption(QFileDialog.Option.DontConfirmOverwrite, True)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    selected = dialog.selectedFiles()
+    return selected[0] if selected else None
+
+
+def confirm_overwrite(parent: QWidget, path: Path, multiple: bool = False) -> bool:
+    """Ask for overwrite confirmation using StemKart's own dialog chrome."""
+    if not path.exists():
+        return True
+
+    if multiple:
+        title = "Replace existing files?"
+        message = "One or more files already exist in this folder.\n\nDo you want to replace them?"
+    else:
+        title = "Replace existing file?"
+        message = f"{path.name} already exists.\n\nDo you want to replace it?"
+    return ask_confirmation(parent, title, message, accept_label="Replace", reject_label="Cancel")
+
+
+class DialogThemeFilter(QObject):
+    """Apply the custom title bar when Qt creates standard dialogs internally."""
+
+    def eventFilter(self, watched, event) -> bool:
+        if isinstance(watched, QDialog):
+            # Polish occurs before the platform surface is shown. Changing
+            # window flags from a modal Show event can leave exec() stuck in a
+            # nested platform loop.
+            if event.type() in (QEvent.Type.Polish, QEvent.Type.WindowTitleChange):
+                style_dialog(watched)
+            elif event.type() == QEvent.Type.Show and isinstance(watched, QMessageBox):
+                normalize_message_box(watched)
+            elif event.type() == QEvent.Type.Resize:
+                minimum_width = 420 if isinstance(watched, QMessageBox) else 360 if isinstance(watched, QInputDialog) else 0
+                if minimum_width and watched.width() < minimum_width:
+                    watched.setMinimumWidth(minimum_width)
+                    watched.resize(minimum_width, watched.height())
+                title_bar = getattr(watched, "_stemkart_title_bar", None)
+                if title_bar is not None:
+                    title_bar.setGeometry(0, 0, watched.width(), 36)
+                    title_bar.raise_()
+        return super().eventFilter(watched, event)
+
+
 class AudioSplitter(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, light_mode: bool = False) -> None:
         super().__init__()
         self.source_path: Path | None = None
         self.split_thread: SplitThread | None = None
@@ -1950,20 +2576,90 @@ class AudioSplitter(QMainWindow):
         self.current_samples_directory: Path | None = None
         self.last_explorer_directory = self.sample_library.last_directory
         self.showing_library = False
+        self.light_mode = light_mode
+        self._folder_scan_generation = 0
+        self._folder_scan_threads: list[QThread] = []
+        self._folder_scan_workers: list[FolderScanWorker] = []
 
         self.setWindowTitle(APP_NAME)
-        self.setFixedSize(1120, 760)
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self.resize(1120, 760)
+        self.setMinimumSize(800, 600)
         self.setAcceptDrops(True)
 
         self._build_ui()
         self.statusBar().setVisible(False)
+        self._size_grip = StemKartSizeGrip(self)
+        self._size_grip.setFixedSize(16, 16)
+        self._size_grip.move(self.width() - self._size_grip.width(), self.height() - self._size_grip.height())
+        self._size_grip.show()
+
+    def toggle_maximized(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def toggle_theme(self) -> None:
+        self.light_mode = not self.light_mode
+        save_app_setting("light_mode", self.light_mode)
+        application = QApplication.instance()
+        if application is None:
+            return
+        sample_list = self.sample_file_list
+        sample_list_parent = sample_list.parentWidget()
+        sample_list_layout = sample_list_parent.layout() if sample_list_parent else None
+        sample_list_index = sample_list_layout.indexOf(sample_list) if sample_list_layout else -1
+        sample_list_was_visible = sample_list.isVisible()
+        if sample_list_layout is not None and sample_list_index >= 0:
+            sample_list_layout.removeWidget(sample_list)
+            sample_list.setParent(None)
+        try:
+            apply_style(application, light_mode=self.light_mode)
+            foreground = application.palette().text().color().name()
+            for button in self.findChildren(QPushButton):
+                if isinstance(button, ThemedIconButton):
+                    button._update_icon_color()
+                elif not button.icon().isNull():
+                    button.setIcon(tinted_icon(button.icon(), foreground, size=24))
+            self.folder_icon_provider = MonochromeIconProvider("#ff7a00")
+            self.folder_model.setIconProvider(self.folder_icon_provider)
+            self.folder_tree.viewport().update()
+            self._style_tabs()
+        finally:
+            if sample_list_layout is not None and sample_list_index >= 0:
+                sample_list_layout.insertWidget(sample_list_index, sample_list, 1)
+                if sample_list_was_visible:
+                    sample_list.show()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_size_grip"):
+            self._size_grip.move(
+                self.width() - self._size_grip.width(),
+                self.height() - self._size_grip.height(),
+            )
 
     def _build_ui(self) -> None:
-        root = QWidget()
-        self.setCentralWidget(root)
+        shell = QWidget()
+        shell.setObjectName("retroWindowShell")
+        shell.setStyleSheet("QWidget#retroWindowShell { background: transparent; }")
+        self.setCentralWidget(shell)
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+
+        root = QFrame()
+        root.setObjectName("retroWindowFrame")
+        self.main_frame = root
+        shell_layout.addWidget(root)
+
         page = QVBoxLayout(root)
-        page.setContentsMargins(6, 6, 6, 6)
-        page.setSpacing(10)
+        page.setContentsMargins(0, 0, 0, 0)
+        page.setSpacing(0)
+
+        self.title_bar = DarkTitleBar(self)
+        page.addWidget(self.title_bar)
 
         tabs = QTabWidget()
         self.tabs = tabs
@@ -2031,20 +2727,50 @@ class AudioSplitter(QMainWindow):
         export_hint.setWordWrap(True)
         export_copy.addWidget(export_hint)
         export_layout.addLayout(export_copy, 1)
-        self.named_export_button = QPushButton("Named folder...")
+        self.named_export_button = ThemedTextButton("Named folder...")
         self.named_export_button.setEnabled(False)
         self.named_export_button.clicked.connect(self.export_named_folder)
-        self.folder_export_button = QPushButton("Existing folder...")
+        self.folder_export_button = ThemedTextButton("Existing folder...")
         self.folder_export_button.setEnabled(False)
         self.folder_export_button.clicked.connect(self.export_existing_folder)
         export_layout.addWidget(self.named_export_button)
         export_layout.addWidget(self.folder_export_button)
         splitter_layout.addWidget(export_panel)
+        self._style_tabs()
+
+    def _style_tabs(self) -> None:
+        background = "#ffffff" if self.light_mode else "#000000"
+        foreground = "#000000" if self.light_mode else "#ffffff"
+        self.tabs.tabBar().setStyleSheet(
+            f"""
+            QTabBar::tab {{
+                background: {background};
+                color: {foreground};
+                border: 1px solid {foreground};
+                border-bottom: none;
+                padding: 5px 12px;
+                margin-left: 8px;
+                margin-right: 2px;
+                position: relative;
+                top: 1px;
+            }}
+            QTabBar::tab:selected, QTabBar::tab:hover {{
+                background: {foreground};
+                color: {background};
+            }}
+            """
+        )
+
+    def _style_main_frame(self) -> None:
+        border_color = "#000000" if self.light_mode else "#ffffff"
+        self.main_frame.setStyleSheet(
+            f"QFrame#retroWindowFrame {{ border: 2px solid {border_color}; }}"
+        )
 
     def _build_samples_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(8)
 
         self.recording_panel = RecordingPanel(self.sample_library.recorded_dir)
@@ -2067,23 +2793,45 @@ class AudioSplitter(QMainWindow):
         view_switch.addWidget(self.explorer_view_button)
         view_switch.addWidget(self.library_view_button)
         view_switch.addStretch()
-        view_switch.setContentsMargins(8, 8, 0, 0)
+        self.directory_search = QLineEdit()
+        self.directory_search.setObjectName("directorySearch")
+        self.directory_search.setPlaceholderText("Search current directory")
+        self.directory_search.setClearButtonEnabled(True)
+        clear_button = self.directory_search.findChild(QToolButton)
+        if clear_button is not None:
+            clear_button.setIcon(bundled_icon("search-clear.svg"))
+            clear_button.setIconSize(QSize(16, 16))
+        self.directory_search.setFixedWidth(260)
+        self.directory_search.setFixedHeight(self.explorer_view_button.sizeHint().height())
+        self.directory_search.textChanged.connect(self._filter_current_directory)
+        view_switch.addWidget(self.directory_search)
+        view_switch.setContentsMargins(8, 8, 8, 0)
         layout.addLayout(view_switch)
 
         browser = QSplitter(Qt.Orientation.Horizontal)
         browser.setChildrenCollapsible(False)
 
-        folders = QGroupBox("")
+        folders = QFrame()
+        folders.setObjectName("folderExplorerPane")
         folders_layout = QVBoxLayout(folders)
-        folders_layout.setContentsMargins(0, 0, 0, 0)
+        folders_layout.setContentsMargins(4, 0, 0, 0)
         self.folder_model = QFileSystemModel(self)
         self.folder_model.setFilter(QDir.Filter.AllDirs | QDir.Filter.NoDotAndDotDot)
         self.filesystem_root = Path.home().anchor or "/"
         root_index = self.folder_model.setRootPath(self.filesystem_root)
+        self.folder_icon_provider = MonochromeIconProvider("#ff7a00")
+        self.folder_model.setIconProvider(self.folder_icon_provider)
         self.folder_tree = QTreeView()
+        self.folder_tree.setStyle(OrangeBranchStyle())
+        self.folder_tree.setMouseTracking(True)
         self.folder_tree.setModel(self.folder_model)
         self.folder_tree.setRootIndex(root_index)
         self.folder_tree.setFrameShape(QFrame.Shape.NoFrame)
+        # The filesystem root's branch connector is rendered as a full-height
+        # vertical rule. It serves no navigation purpose here and visually
+        # bleeds through the folder pane, so keep child expanders but hide the
+        # root decoration.
+        self.folder_tree.setRootIsDecorated(False)
         self.folder_tree.setHeaderHidden(True)
         self.folder_tree.setColumnHidden(1, True)
         self.folder_tree.setColumnHidden(2, True)
@@ -2092,6 +2840,7 @@ class AudioSplitter(QMainWindow):
         folders_layout.addWidget(self.folder_tree)
 
         self.library_tree = QTreeWidget()
+        self.library_tree.setStyle(OrangeBranchStyle())
         self.library_tree.setHeaderHidden(True)
         self.library_tree.setFrameShape(QFrame.Shape.NoFrame)
         self.library_tree.itemClicked.connect(self._library_tree_changed)
@@ -2099,9 +2848,10 @@ class AudioSplitter(QMainWindow):
         folders_layout.addWidget(self.library_tree)
         browser.addWidget(folders)
 
-        files = QGroupBox("")
+        files = QFrame()
+        files.setObjectName("fileExplorerPane")
         files_layout = QVBoxLayout(files)
-        files_layout.setContentsMargins(0, 0, 0, 0)
+        files_layout.setContentsMargins(8, 8, 8, 8)
         self.samples_location_label = QLabel("Select a folder")
         self.samples_location_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         files_layout.addWidget(self.samples_location_label)
@@ -2114,8 +2864,10 @@ class AudioSplitter(QMainWindow):
 
         self.scan_recursive_checkbox = QCheckBox("Scan subfolders")
         self.scan_recursive_checkbox.setChecked(self.sample_library.scan_recursive)
-        self.scan_recursive_checkbox.toggled.connect(self.sample_library.set_scan_recursive)
-        files_layout.addWidget(self.scan_recursive_checkbox)
+        self.scan_recursive_checkbox.toggled.connect(self._scan_recursive_changed)
+
+        self.samples_status = QLabel()
+        self.samples_status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.actions_one_widget = QWidget()
         actions_one = QHBoxLayout(self.actions_one_widget)
@@ -2132,7 +2884,6 @@ class AudioSplitter(QMainWindow):
         self.copy_folder_button.clicked.connect(self._copy_folder_to_library)
         actions_one.addWidget(self.add_folder_button)
         actions_one.addWidget(self.copy_folder_button)
-        files_layout.addWidget(self.actions_one_widget)
 
         self.actions_two_widget = self.actions_one_widget
 
@@ -2145,33 +2896,51 @@ class AudioSplitter(QMainWindow):
         self.rename_library_folder_button.clicked.connect(self._rename_library_folder)
         self.delete_library_folder_button = QPushButton("Delete")
         self.delete_library_folder_button.clicked.connect(self._delete_library_folder)
+        self.delete_library_files_button = QPushButton("Delete Files")
+        self.delete_library_files_button.clicked.connect(self._delete_library_files)
         self.refresh_library_button = QPushButton("Refresh")
         self.refresh_library_button.clicked.connect(self._refresh_library)
         for button in (
             self.new_library_folder_button,
             self.rename_library_folder_button,
             self.delete_library_folder_button,
+            self.delete_library_files_button,
             self.refresh_library_button,
         ):
             library_actions.addWidget(button)
         library_actions.addStretch()
         self.library_actions_widget.setVisible(False)
-        files_layout.addWidget(self.library_actions_widget)
 
-        self.samples_status = QLabel()
-        files_layout.addWidget(self.samples_status)
+        samples_metadata = QWidget()
+        metadata_layout = QHBoxLayout(samples_metadata)
+        metadata_layout.setContentsMargins(0, 0, 0, 0)
+        metadata_layout.setSpacing(8)
+        metadata_layout.addWidget(self.scan_recursive_checkbox)
+        metadata_layout.addWidget(self.samples_status, 1)
+
+        samples_footer = QWidget()
+        footer_layout = QVBoxLayout(samples_footer)
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.setSpacing(8)
+        footer_layout.addWidget(samples_metadata)
+        footer_layout.addWidget(self.actions_one_widget)
+        footer_layout.addWidget(self.library_actions_widget)
+        files_layout.addWidget(samples_footer)
         browser.addWidget(files)
         browser.setStretchFactor(0, 0)
         browser.setStretchFactor(1, 1)
-        browser.setSizes([280, 780])
-        layout.addWidget(browser, 1)
+        browser.setSizes([420, 696])
+        explorer_content = QVBoxLayout()
+        explorer_content.setContentsMargins(0, 0, 0, 0)
+        explorer_content.setSpacing(0)
+        explorer_content.addWidget(browser, 1)
 
         # The waveform editor is the only visible preview surface. Keep the
         # player as a hidden engine for audio output and transport state.
         self.preview_player = PreviewPlayer(page)
         self.preview_player.setVisible(False)
         self.waveform_editor = WaveformEditor()
-        self.waveform_editor.setFixedHeight(280)
+        self.waveform_editor.setFixedHeight(272)
         self.waveform_editor.set_preview_callback(self._preview_trim_range)
         self.waveform_editor.playhead_requested.connect(self._seek_preview_from_waveform)
         self.waveform_editor.split_requested.connect(self._split_current_sample)
@@ -2185,7 +2954,8 @@ class AudioSplitter(QMainWindow):
         self.waveform_editor.forward_button.clicked.connect(lambda: self._seek_trim_playback(5000))
         self.waveform_editor.skip_end_button.clicked.connect(self._skip_trim_end)
         self.preview_player.playhead_changed.connect(self.waveform_editor.set_playhead)
-        layout.addWidget(self.waveform_editor)
+        explorer_content.addWidget(self.waveform_editor)
+        layout.addLayout(explorer_content, 1)
 
         last_directory = self.sample_library.last_directory
         self._restore_samples_directory(last_directory)
@@ -2232,10 +3002,49 @@ class AudioSplitter(QMainWindow):
         if path.is_dir():
             self._show_directory(path)
 
+    def _scan_recursive_changed(self, enabled: bool) -> None:
+        self.sample_library.set_scan_recursive(enabled)
+        if not self.showing_library and self.current_samples_directory:
+            self._show_directory(self.current_samples_directory)
+
+    def _forget_folder_scan_thread(self, thread: QThread, worker: FolderScanWorker) -> None:
+        if thread in self._folder_scan_threads:
+            self._folder_scan_threads.remove(thread)
+        if worker in self._folder_scan_workers:
+            self._folder_scan_workers.remove(worker)
+
+    def _start_folder_scan(self, path: Path, generation: int) -> None:
+        for thread in self._folder_scan_threads:
+            thread.requestInterruption()
+        self._replace_sample_file_list([], "Scanning folder...")
+        thread = QThread(self)
+        worker = FolderScanWorker(self.sample_library, path, recursive=True, generation=generation)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._folder_scan_finished)
+        worker.completed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(
+            lambda thread=thread, worker=worker: self._forget_folder_scan_thread(thread, worker)
+        )
+        self._folder_scan_threads.append(thread)
+        self._folder_scan_workers.append(worker)
+        thread.start()
+
+    @pyqtSlot(object, int)
+    def _folder_scan_finished(self, paths: list[Path], generation: int) -> None:
+        if generation != self._folder_scan_generation:
+            return
+        if self.showing_library or self.current_samples_directory is None:
+            return
+        self._replace_sample_file_list(paths, f"{len(paths)} audio files")
+
     def _populate_library_tree(self) -> None:
         self.library_tree.clear()
+        folder_icon = self.folder_icon_provider.folder_icon
 
         library_root = QTreeWidgetItem(["Library"])
+        library_root.setIcon(0, folder_icon)
         library_root.setData(0, Qt.ItemDataRole.UserRole, str(self.sample_library.root))
         self.library_tree.addTopLevelItem(library_root)
 
@@ -2249,12 +3058,14 @@ class AudioSplitter(QMainWindow):
                 return
             for child in directories:
                 item = QTreeWidgetItem([child.name])
+                item.setIcon(0, folder_icon)
                 item.setData(0, Qt.ItemDataRole.UserRole, str(child))
                 parent.addChild(item)
                 add_children(item, child)
 
         add_children(library_root, self.sample_library.root)
         references = QTreeWidgetItem(["References"])
+        references.setIcon(0, folder_icon)
         references.setData(0, Qt.ItemDataRole.UserRole, "references")
         self.library_tree.addTopLevelItem(references)
         self.library_tree.expandItem(library_root)
@@ -2271,15 +3082,29 @@ class AudioSplitter(QMainWindow):
         self.current_samples_directory = None
         self.samples_location_label.clear()
         self.samples_location_label.setVisible(False)
-        self.sample_file_list.clear()
-        for audio_path in self.sample_library.reference_files():
-            list_item = QListWidgetItem(audio_path.name)
-            list_item.setData(Qt.ItemDataRole.UserRole, str(audio_path))
-            if not audio_path.exists():
-                list_item.setEnabled(False)
-                list_item.setToolTip("Original file is no longer available")
-            self.sample_file_list.addItem(list_item)
-        self.samples_status.setText(f"{self.sample_file_list.count()} referenced files")
+        paths = self.sample_library.reference_files()
+        self._replace_sample_file_list(paths, f"{len(paths)} referenced files")
+
+    def _replace_sample_file_list(self, paths: list[Path], status_text: str) -> None:
+        self.preview_player.set_file(None)
+        self.waveform_editor.set_file(None)
+        signals_were_blocked = self.sample_file_list.blockSignals(True)
+        updates_were_enabled = self.sample_file_list.updatesEnabled()
+        self.sample_file_list.setUpdatesEnabled(False)
+        try:
+            self.sample_file_list.clear()
+            self.sample_file_list.addItems([audio_path.name for audio_path in paths])
+            for index, audio_path in enumerate(paths):
+                list_item = self.sample_file_list.item(index)
+                list_item.setData(Qt.ItemDataRole.UserRole, str(audio_path))
+                if not audio_path.exists():
+                    list_item.setEnabled(False)
+                    list_item.setToolTip("Original file is no longer available")
+        finally:
+            self.sample_file_list.setUpdatesEnabled(updates_were_enabled)
+            self.sample_file_list.blockSignals(signals_were_blocked)
+        self._filter_current_directory()
+        self.samples_status.setText(status_text)
 
     def _show_directory(self, path: Path) -> None:
         if not path.is_dir():
@@ -2290,12 +3115,20 @@ class AudioSplitter(QMainWindow):
             self.last_explorer_directory = path
             self.sample_library.set_last_directory(path)
         self.samples_location_label.setText(str(path))
-        self.sample_file_list.clear()
-        for audio_path in sorted((item for item in path.iterdir() if is_audio_file(item)), key=lambda item: item.name.casefold()):
-            list_item = QListWidgetItem(audio_path.name)
-            list_item.setData(Qt.ItemDataRole.UserRole, str(audio_path))
-            self.sample_file_list.addItem(list_item)
-        self.samples_status.setText(f"{self.sample_file_list.count()} audio files")
+        recursive = not self.showing_library and self.scan_recursive_checkbox.isChecked()
+        self._folder_scan_generation += 1
+        generation = self._folder_scan_generation
+        if recursive:
+            self._start_folder_scan(path, generation)
+            return
+        paths = self.sample_library.scan_folder(path, recursive)
+        self._replace_sample_file_list(paths, f"{len(paths)} audio files")
+
+    def _filter_current_directory(self) -> None:
+        query = self.directory_search.text().strip().casefold()
+        for index in range(self.sample_file_list.count()):
+            item = self.sample_file_list.item(index)
+            item.setHidden(bool(query) and query not in item.text().casefold())
 
     def _show_current_folder(self) -> None:
         self._show_directory(self.last_explorer_directory)
@@ -2317,6 +3150,8 @@ class AudioSplitter(QMainWindow):
         path = Path(value) if value else None
         self.preview_player.set_file(path)
         self.waveform_editor.set_file(path)
+        if path is not None and path.exists():
+            self.set_source(path)
 
     def _add_selected_references(self) -> None:
         paths = self._selected_sample_paths()
@@ -2362,7 +3197,7 @@ class AudioSplitter(QMainWindow):
             return None
         name = name.strip()
         if not name or name in {".", ".."} or Path(name).name != name:
-            QMessageBox.warning(self, title, "Enter a single folder name without path separators.")
+            show_message(self, title, "Enter a single folder name without path separators.")
             return None
         return name
 
@@ -2373,12 +3208,12 @@ class AudioSplitter(QMainWindow):
             return
         destination = parent / name
         if destination.exists():
-            QMessageBox.warning(self, "Folder already exists", f"A folder named {name!r} already exists here.")
+            show_message(self, "Folder already exists", f"A folder named {name!r} already exists here.")
             return
         try:
             destination.mkdir()
         except OSError as exc:
-            QMessageBox.critical(self, "Could not create folder", str(exc))
+            show_message(self, "Could not create folder", str(exc))
             return
         self._refresh_library(destination)
 
@@ -2389,7 +3224,7 @@ class AudioSplitter(QMainWindow):
             return
         renamed = self.sample_library.rename_library_directory(path, name)
         if renamed is None:
-            QMessageBox.warning(
+            show_message(
                 self,
                 "Folder cannot be renamed",
                 "Only user-created library folders can be renamed, and the destination name must be unused.",
@@ -2400,20 +3235,53 @@ class AudioSplitter(QMainWindow):
     def _delete_library_folder(self) -> None:
         path = self._selected_library_directory()
         if path.resolve() in self.sample_library.protected_directories() or path.resolve() == self.sample_library.root.resolve():
-            QMessageBox.warning(self, "Folder cannot be deleted", "StemKart's root and system folders are protected.")
+            show_message(self, "Folder cannot be deleted", "StemKart's root and system folders are protected.")
             return
-        answer = QMessageBox.question(
-            self,
-            "Delete empty folder?",
-            f"Delete the empty folder {path.name!r}?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        try:
+            children = list(path.iterdir())
+        except OSError as exc:
+            show_message(self, "Folder not deleted", f"StemKart could not inspect this folder:\n{exc}")
             return
-        if not self.sample_library.remove_library_directory(path):
-            QMessageBox.warning(self, "Folder not deleted", "Only empty library folders can be deleted.")
+        recursive = bool(children)
+        if recursive:
+            title = "Delete folder and contents?"
+            message = f"Delete {path.name!r} and its {len(children)} item(s)? This cannot be undone."
+        else:
+            title = "Delete empty folder?"
+            message = f"Delete the empty folder {path.name!r}?"
+        if not ask_confirmation(self, title, message):
+            return
+        if not self.sample_library.remove_library_directory(path, recursive=recursive):
+            show_message(self, "Folder not deleted", "StemKart could not remove that library folder.")
             return
         self._refresh_library(self.sample_library.root)
+
+    def _delete_library_files(self) -> None:
+        if not self.showing_library:
+            return
+        paths = [
+            path
+            for path in self._selected_sample_paths()
+            if path.is_file() and self.sample_library.is_library_path(path)
+        ]
+        if not paths:
+            show_message(self, "Delete library files", "Select one or more files in the library first.")
+            return
+        names = ", ".join(path.name for path in paths[:3])
+        if len(paths) > 3:
+            names += f", and {len(paths) - 3} more"
+        if not ask_confirmation(
+            self,
+            "Delete library files?",
+            f"Delete {len(paths)} file(s)?\n\n{names}",
+        ):
+            return
+        deleted = self.sample_library.remove_library_files(paths)
+        if len(deleted) != len(paths):
+            self.samples_status.setText(f"Deleted {len(deleted)} of {len(paths)} selected files")
+        else:
+            self.samples_status.setText(f"Deleted {len(deleted)} library file(s)")
+        self._refresh_library(self.current_samples_directory)
 
     def _refresh_library(self, selected: Path | None = None) -> None:
         if not self.showing_library:
@@ -2484,10 +3352,8 @@ class AudioSplitter(QMainWindow):
     def _trim_saved(self, path: Path) -> None:
         self.sample_library.add_trimmed(path)
         self.samples_status.setText(f"Saved {path.name}")
-        self.preview_player.set_file(path)
         if self.showing_library:
             self._populate_library_tree()
-            self._show_directory(self.sample_library.trimmed_dir)
 
     def _set_split_progress_visible(self, visible: bool) -> None:
         self.progress_bar.setVisible(visible)
@@ -2568,13 +3434,13 @@ class AudioSplitter(QMainWindow):
             self.folder_export_button.setEnabled(True)
         else:
             self.statusBar().clearMessage()
-            QMessageBox.warning(self, "No stems found", "Demucs finished without producing the expected WAV files.")
+            show_message(self, "No stems found", "Demucs finished without producing the expected WAV files.")
 
     @pyqtSlot(str)
     def _split_failed(self, message: str) -> None:
         self._set_split_progress_visible(False)
         self.statusBar().showMessage("Split failed")
-        QMessageBox.critical(self, "Could not split track", message)
+        show_message(self, "Could not split track", message)
 
     def _split_finished(self) -> None:
         self.split_button.setEnabled(self.source_path is not None)
@@ -2592,20 +3458,27 @@ class AudioSplitter(QMainWindow):
         event.accept()
 
     def export_card(self, card: StemCard) -> None:
-        if not card.file_path:
+        if not card.file_path or wav_availability(card.file_path) != "usable":
+            card.set_empty()
             return
-        destination, _ = QFileDialog.getSaveFileName(
+        destination = choose_save_path(
             self,
             f"Save {pretty_name(card.stem)} WAV",
-            f"{card.stem}.wav",
+            self.sample_library.root / f"{card.stem}.wav",
             "WAV files (*.wav)",
         )
-        if destination:
+        if destination and confirm_overwrite(self, Path(destination)):
             shutil.copy2(card.file_path, destination)
             self.statusBar().showMessage(f"Saved {Path(destination).name}")
 
     def _available_files(self) -> list[Path]:
-        return [card.file_path for card in self.cards.values() if card.file_path is not None]
+        available: list[Path] = []
+        for card in self.cards.values():
+            if card.file_path is not None and wav_availability(card.file_path) == "usable":
+                available.append(card.file_path)
+            elif card.file_path is not None:
+                card.set_empty()
+        return available
 
     def _copy_all(self, destination: Path) -> int:
         files = self._available_files()
@@ -2638,17 +3511,11 @@ class AudioSplitter(QMainWindow):
         files = self._available_files()
         collisions = [destination / source.name for source in files if (destination / source.name).exists()]
         if collisions:
-            answer = QMessageBox.question(
-                self,
-                "Replace existing WAV files?",
-                f"{len(collisions)} file(s) already exist in this folder. Replace them?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
+            if not confirm_overwrite(self, destination, multiple=True):
                 return
         count = self._copy_all(destination)
         self.statusBar().showMessage(f"Exported {count} WAV files to {destination.name}")
-        QMessageBox.information(self, "Export complete", f"Saved {count} WAV files in:\n{destination}")
+        show_message(self, "Export complete", f"Saved {count} WAV files in:\n{destination}")
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
@@ -2663,18 +3530,342 @@ class AudioSplitter(QMainWindow):
                 event.acceptProposedAction()
 
 
-def apply_style(app: QApplication) -> None:
-    # Use the platform's ordinary Qt style: no stylesheet, theme, or custom chrome.
-    _ = app
+def apply_style(app: QApplication, light_mode: bool = False) -> None:
+    """Apply StemKart's black-and-white theme in dark or inverted light mode."""
+    app._stemkart_light_mode = light_mode
+    app.styleHints().setColorScheme(Qt.ColorScheme.Light if light_mode else Qt.ColorScheme.Dark)
+    app.setStyle("Fusion")
+
+    background = QColor(255, 255, 255) if light_mode else QColor(0, 0, 0)
+    foreground = QColor(0, 0, 0) if light_mode else QColor(255, 255, 255)
+    palette = QPalette()
+    for role in (
+        QPalette.ColorRole.Window,
+        QPalette.ColorRole.Base,
+        QPalette.ColorRole.AlternateBase,
+        QPalette.ColorRole.Button,
+    ):
+        palette.setColor(role, background)
+    for role in (
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.ButtonText,
+        QPalette.ColorRole.BrightText,
+        QPalette.ColorRole.HighlightedText,
+        QPalette.ColorRole.Link,
+    ):
+        palette.setColor(role, foreground)
+    palette.setColor(QPalette.ColorRole.Highlight, foreground)
+    palette.setColor(QPalette.ColorRole.ToolTipBase, background)
+    palette.setColor(QPalette.ColorRole.ToolTipText, foreground)
+    disabled = QPalette.ColorGroup.Disabled
+    palette.setColor(disabled, QPalette.ColorRole.WindowText, foreground)
+    palette.setColor(disabled, QPalette.ColorRole.Text, foreground)
+    palette.setColor(disabled, QPalette.ColorRole.ButtonText, foreground)
+    palette.setColor(disabled, QPalette.ColorRole.Highlight, foreground)
+    palette.setColor(disabled, QPalette.ColorRole.HighlightedText, background)
+    app.setPalette(palette)
+
+    family = load_bundled_font()
+    font = QFont(family, 10)
+    font.setStyleHint(QFont.StyleHint.SansSerif)
+    app.setFont(font)
+
+    stylesheet = f"""
+        QWidget {{
+            background: #000000;
+            color: #ffffff;
+            font-family: "{family}";
+            font-size: 12pt;
+        }}
+        QMainWindow, QDialog, QMenu, QMenuBar, QToolTip {{
+            background: #000000;
+            color: #ffffff;
+        }}
+        QDialog {{
+            background: #000000;
+            color: #ffffff;
+            border: 1px solid #ff7a00;
+        }}
+        QWidget#titleBar {{
+            background: #000000;
+            border-bottom: 1px solid #ffffff;
+        }}
+        QLabel#titleBarTitle {{
+            background: #000000;
+            color: #ffffff;
+            font-weight: 600;
+        }}
+        QWidget#titleBarButtons {{
+            background: #000000;
+        }}
+        QFrame#retroWindowFrame {{
+            border: 2px solid #ffffff;
+        }}
+        QPushButton#windowButton {{
+            background: #000000;
+            color: #ffffff;
+            border: 1px solid #000000;
+            padding: 0px;
+            font-size: 12pt;
+        }}
+        QPushButton#windowButton:hover, QPushButton#windowButton:focus {{
+            background: #ffffff;
+            color: #000000;
+            border-color: #ffffff;
+        }}
+        QPushButton#windowButton:pressed {{
+            background: #ffffff;
+            color: #000000;
+        }}
+        QGroupBox {{
+            border: 1px solid #ffffff;
+            border-radius: 0px;
+            margin-top: 10px;
+            padding: 8px;
+        }}
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 8px;
+            padding: 0 4px;
+            background: #000000;
+            color: #ffffff;
+        }}
+        QFrame#folderExplorerPane {{
+            border: none;
+        }}
+        QFrame#fileExplorerPane {{
+            border-top: none;
+            border-bottom: none;
+            border-left: none;
+            border-right: none;
+        }}
+        QGroupBox#sampleTrimmingContainer {{
+            margin-top: 0px;
+            border-left: none;
+            border-right: none;
+            border-bottom: none;
+        }}
+        QPushButton {{
+            background: #000000;
+            color: #ffffff;
+            border: 1px solid #ffffff;
+            border-radius: 0px;
+            padding: 4px 8px;
+        }}
+        QPushButton:hover, QPushButton:pressed {{
+            background: #ffffff;
+            color: #000000;
+        }}
+        QPushButton:focus {{
+            outline: none;
+        }}
+        QPushButton:disabled {{
+            background: #000000;
+            color: #ffffff;
+            border-color: #ffffff;
+        }}
+        QLineEdit, QComboBox {{
+            background: #000000;
+            color: #ffffff;
+            border: 1px solid #ffffff;
+            border-radius: 0px;
+            selection-background-color: #ffffff;
+            selection-color: #000000;
+        }}
+        QLineEdit#directorySearch {{
+            padding-left: 4px;
+        }}
+        QComboBox {{
+            padding-left: 4px;
+        }}
+        QListWidget, QTreeWidget, QTreeView {{
+            background: #000000;
+            color: #ffffff;
+            border: none;
+            outline: none;
+            selection-background-color: #ffffff;
+            selection-color: #000000;
+        }}
+        QComboBox::drop-down {{
+            background: #000000;
+            border-left: 1px solid #ffffff;
+            width: 22px;
+        }}
+        QComboBox QAbstractItemView {{
+            background: #000000;
+            color: #ffffff;
+            border: 1px solid #ffffff;
+            selection-background-color: #ffffff;
+            selection-color: #000000;
+        }}
+        QAbstractItemView::item:hover, QAbstractItemView::item:selected {{
+            background: #ffffff;
+            color: #000000;
+        }}
+        QTabWidget::pane {{
+            background: #000000;
+            border-top: 1px solid #ffffff;
+            border-right: none;
+            border-bottom: none;
+            border-left: none;
+        }}
+        QTabBar::tab {{
+            background: #000000;
+            color: #ffffff;
+            border: 1px solid #ffffff;
+        }}
+        QTabBar::tab {{
+            padding: 5px 12px;
+            margin-right: 2px;
+        }}
+        QTabBar::tab:selected, QTabBar::tab:hover {{
+            background: #ffffff;
+            color: #000000;
+        }}
+        QProgressBar {{
+            background: #000000;
+            color: #ffffff;
+            border: 1px solid #ffffff;
+            text-align: center;
+        }}
+        QProgressBar::chunk {{
+            background: #ffffff;
+        }}
+        QSlider::groove:horizontal {{
+            background: #000000;
+            border: 1px solid #ffffff;
+            height: 6px;
+        }}
+        QSlider::handle:horizontal {{
+            background: #ffffff;
+            border: 1px solid #000000;
+            width: 12px;
+            margin: -5px 0;
+        }}
+        QCheckBox::indicator {{
+            width: 14px;
+            height: 14px;
+            background: #000000;
+            border: 1px solid #ffffff;
+        }}
+        QCheckBox::indicator:checked {{
+            background: #ffffff;
+            border: 1px solid #ffffff;
+        }}
+        QSplitter::handle {{
+            background: #ffffff;
+        }}
+        QSplitter::handle:horizontal {{
+            width: 1px;
+        }}
+        QSplitter::handle:vertical {{
+            height: 1px;
+        }}
+        QScrollBar:vertical {{
+            background: #000000;
+            border: none;
+            width: 14px;
+            margin: 0px;
+        }}
+        QScrollBar:horizontal {{
+            background: #000000;
+            border: 1px solid #ffffff;
+            height: 14px;
+            margin: 0px;
+        }}
+        QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+            background: #ff7a00;
+            border: 1px solid #000000;
+            min-height: 20px;
+            min-width: 20px;
+        }}
+        QScrollBar::add-line, QScrollBar::sub-line,
+        QScrollBar::add-page, QScrollBar::sub-page {{
+            background: #000000;
+            border: none;
+        }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+            height: 0px;
+        }}
+        QHeaderView::section {{
+            background: #000000;
+            color: #ffffff;
+            border: 1px solid #ffffff;
+        }}
+        QToolTip {{
+            border: 1px solid #000000;
+            background: #ffffff;
+            color: #000000;
+        }}
+        """
+    if light_mode:
+        stylesheet = stylesheet.replace("#000000", "__STEMKART_BLACK__").replace("#ffffff", "#000000").replace("__STEMKART_BLACK__", "#ffffff")
+        stylesheet += """
+        QPushButton#transportButton:hover,
+        QPushButton#transportButton:pressed,
+        QPushButton#transportButton:checked {
+            background: #000000;
+            color: #ffffff;
+            border-color: #000000;
+        }
+        QPushButton#transportButton[stemkart_active="true"] {
+            background: #000000;
+            color: #ffffff;
+            border-color: #000000;
+        }
+        QPushButton#markerButton[stemkart_active="true"] {
+            background: #000000;
+            color: #ffffff;
+            border-color: #000000;
+        }
+        QPushButton#markerButton[stemkart_active="true"]:disabled {
+            background: #000000;
+            color: #ffffff;
+            border-color: #000000;
+        }
+        """
+    else:
+        stylesheet += """
+        QPushButton#transportButton:hover,
+        QPushButton#transportButton:pressed,
+        QPushButton#transportButton:checked {
+            background: #ffffff;
+            color: #000000;
+            border-color: #ffffff;
+        }
+        QPushButton#transportButton[stemkart_active="true"] {
+            background: #ffffff;
+            color: #000000;
+            border-color: #ffffff;
+        }
+        QPushButton#markerButton[stemkart_active="true"] {
+            background: #ffffff;
+            color: #000000;
+            border-color: #ffffff;
+        }
+        QPushButton#markerButton[stemkart_active="true"]:disabled {
+            background: #ffffff;
+            color: #000000;
+            border-color: #ffffff;
+        }
+        """
+    app.setStyleSheet(stylesheet)
 
 
 def main() -> int:
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
     app.setDesktopFileName(APP_SLUG)
-    apply_style(app)
-    window = AudioSplitter()
+    settings = load_app_settings()
+    light_mode = settings.get("light_mode") is True
+    apply_style(app, light_mode=light_mode)
+    dialog_theme_filter = DialogThemeFilter(app)
+    app.installEventFilter(dialog_theme_filter)
+    app._stemkart_dialog_theme_filter = dialog_theme_filter
+    window = AudioSplitter(light_mode=light_mode)
     window.show()
     return app.exec()
 

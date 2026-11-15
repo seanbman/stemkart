@@ -7,6 +7,8 @@ StemKart is a local PyQt6 desktop app for recording, organizing samples, and spl
 - bass
 - other
 
+The interface uses a bundled IBM Plex Sans typeface and a strict black-and-white visual theme. In-app icons retain their existing shapes and are rendered in white; the waveform is the focused editing surface, with an orange signal, a red playback line, and white trim markers. The title bar includes an optional Light mode toggle that inverts the black-and-white surfaces and icons while retaining the waveform accents; the selected mode is remembered in the application config. The Linux launcher artwork is kept separate.
+
 The Samples tab provides a two-pane disk browser, persistent external references, optional copies into a local library, recording, preview playback, and waveform-based trimming to new WAV files. On Linux with PipeWire, the recording source can be a microphone, the monitor of a playback device, or an active application's audio stream. The Stem Splitter tab has playback for every stem and three export choices: save one stem, put every stem directly into an existing folder, or create a new named folder containing every stem.
 
 ## Setup
@@ -24,7 +26,7 @@ Run it with:
 .venv/bin/python main.py
 ```
 
-The first split downloads the Demucs model and may take a few minutes. Generated stems are held in a temporary directory until the app closes; use one of the export buttons to keep them. Sample-library metadata and copied/trimmed/recorded files are stored locally under the platform's application-data directory (on Linux, normally `~/.local/share/stemkart/samples/`), while referenced source files stay in their original locations. The Library view mirrors folders under that local `samples/` directory, so folders and audio files added manually are detected with Refresh or when the Library view is opened. Library folders can be created and renamed in the app; only empty user-created folders can be deleted. StemKart does not upload audio files.
+The first split downloads the Demucs model and may take a few minutes. Generated stems are held in a temporary directory until the app closes; use one of the export buttons to keep them. Sample-library metadata and copied/trimmed/recorded files are stored locally under the platform's application-data directory (on Linux, normally `~/.local/share/stemkart/samples/`), while global settings such as the theme are stored under the platform's config directory (on Linux, normally `~/.config/stemkart/settings.json`). Referenced source files stay in their original locations. The Library view mirrors folders under that local `samples/` directory, so folders and audio files added manually are detected with Refresh or when the Library view is opened. Library folders can be created and renamed in the app; only empty user-created folders can be deleted. StemKart does not upload audio files.
 
 ## Notes
 
