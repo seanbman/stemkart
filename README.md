@@ -11,9 +11,11 @@ The interface uses a bundled IBM Plex Sans typeface and a strict black-and-white
 
 The Samples tab provides a two-pane disk browser, persistent external references, optional copies into a local library, recording, preview playback, and waveform-based trimming to new WAV files. On Linux with PipeWire, the recording source can be a microphone, the monitor of a playback device, or an active application's audio stream. The Stem Splitter tab has playback for every stem and three export choices: save one stem, put every stem directly into an existing folder, or create a new named folder containing every stem.
 
+The Effects tab applies a reorderable chain of high-pass EQ, filtering, compression, transient shaping, saturation, modulation, delay, and reverb to the active Samples-tab editor selection. Effect chains can be saved as named local presets and exported as new WAV files in the trimmed sample library.
+
 ## Setup
 
-FFmpeg and Python 3.10+ are required. Linux system-audio and per-application recording additionally use the `pw-dump`, `pw-record`, and `pw-link` commands from PipeWire. The setup below uses the CPU-only PyTorch wheel so it does not install CUDA/NVIDIA packages:
+FFmpeg, the Rubber Band CLI (`rubberband`), and Python 3.10+ are required. Linux system-audio and per-application recording additionally use the `pw-dump`, `pw-record`, and `pw-link` commands from PipeWire. The setup below uses the CPU-only PyTorch wheel so it does not install CUDA/NVIDIA packages:
 
 ```bash
 uv venv

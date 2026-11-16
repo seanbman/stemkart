@@ -18,7 +18,17 @@ from typing import Callable
 
 import numpy as np
 
-from PyQt6.QtCore import QFile, QDir, QEvent, QIODevice, QFileInfo, QFileSystemWatcher, QSignalBlocker, QThread, QTimer, QUrl, Qt, QSize, QObject, pyqtSignal, pyqtSlot
+from effects import (
+    EFFECT_LABELS,
+    EffectState,
+    chain_from_dicts,
+    default_chain,
+    process_chain,
+    process_time_pitch,
+    write_wav,
+)
+
+from PyQt6.QtCore import QFile, QDir, QEvent, QIODevice, QFileInfo, QFileSystemWatcher, QSignalBlocker, QThread, QTimer, QUrl, Qt, QSize, QObject, QPointF, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import (
     QColor,
     QDragEnterEvent,
@@ -39,6 +49,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDial,
     QFileDialog,
     QFileIconProvider,
     QGridLayout,
@@ -1584,6 +1595,7 @@ class PreviewPlayer(QGroupBox):
     def _duration_changed(self, duration: int) -> None:
         self.position_slider.setRange(0, max(0, duration))
         self.duration_label.setText(format_time(duration))
+        self.playhead_changed.emit(self.player.position(), duration)
 
     def _media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
         if not self.file_path:
@@ -1897,6 +1909,8 @@ class WaveformEditor(QGroupBox):
     working_file_changed = pyqtSignal(object)
     playhead_requested = pyqtSignal(int)
     split_requested = pyqtSignal(object)
+    samples_changed = pyqtSignal(object, int, str)
+    selection_changed = pyqtSignal(int, int)
 
     def __init__(self) -> None:
         super().__init__("")
@@ -2106,6 +2120,7 @@ class WaveformEditor(QGroupBox):
         self.working_name = self.file_path.name if self.file_path else ""
         self.undo_state = None
         self.waveform.set_samples(self.samples, self.sample_rate)
+        self.samples_changed.emit(self.samples, self.sample_rate, self.working_name)
         self.playback_time_label.setText("0:00 - 0:00")
         self._set_action_state(False)
         if not self.file_path:
@@ -2128,6 +2143,7 @@ class WaveformEditor(QGroupBox):
         self.sample_rate = sample_rate
         self.waveform.set_samples(samples, sample_rate)
         self.file_label.setText(self.working_name)
+        self.samples_changed.emit(self.samples, self.sample_rate, self.working_name)
         self._set_action_state(True)
 
     def _failed_if_current(self, load_serial: int, message: str) -> None:
@@ -2136,6 +2152,7 @@ class WaveformEditor(QGroupBox):
         self.file_label.setText(f"Waveform unavailable: {message}")
 
     def _range_changed(self, start: int, end: int) -> None:
+        self.selection_changed.emit(start, end)
         if not self.samples.size:
             self.range_label.setText("Full file")
             self._set_action_state(False)
@@ -2195,6 +2212,7 @@ class WaveformEditor(QGroupBox):
         self.working_name = "untitled.wav"
         self.waveform.set_samples(self.samples, self.sample_rate)
         self.file_label.setText(self.working_name)
+        self.samples_changed.emit(self.samples, self.sample_rate, self.working_name)
         self._emit_working_preview()
         self._set_action_state(True)
         self.undo_button.setEnabled(True)
@@ -2206,6 +2224,7 @@ class WaveformEditor(QGroupBox):
         self.undo_state = None
         self.waveform.set_samples(self.samples, self.sample_rate)
         self.file_label.setText(self.working_name)
+        self.samples_changed.emit(self.samples, self.sample_rate, self.working_name)
         self._emit_working_preview()
         self._set_action_state(True)
 
@@ -2236,6 +2255,660 @@ class WaveformEditor(QGroupBox):
             self.decode_thread.cancel()
             self.decode_thread.wait(1500)
         shutil.rmtree(self.preview_dir, ignore_errors=True)
+
+
+class EffectRenderWorker(QThread):
+    rendered = pyqtSignal(int, object, int)
+    failed = pyqtSignal(int, str)
+
+    def __init__(
+        self,
+        serial: int,
+        samples: np.ndarray,
+        sample_rate: int,
+        chain: list[EffectState],
+        octave: int,
+        key: int,
+        speed: float,
+        formant_preservation: bool,
+    ) -> None:
+        super().__init__()
+        self.serial = serial
+        self.samples = samples
+        self.sample_rate = sample_rate
+        self.chain = chain
+        self.octave = octave
+        self.key = key
+        self.speed = speed
+        self.formant_preservation = formant_preservation
+
+    def run(self) -> None:
+        try:
+            transformed = process_time_pitch(
+                self.samples,
+                self.sample_rate,
+                self.octave,
+                self.key,
+                self.speed,
+                self.formant_preservation,
+            )
+            rendered = process_chain(transformed, self.sample_rate, self.chain)
+        except Exception as exc:  # Keep a malformed processor from taking down the UI.
+            self.failed.emit(self.serial, str(exc))
+            return
+        self.rendered.emit(self.serial, rendered, self.sample_rate)
+
+
+class EffectModeComboBox(QComboBox):
+    """Mode dropdown whose closed state never paints a selected-item highlight."""
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        background = self.palette().base().color()
+        foreground = self.palette().text().color()
+        painter.fillRect(self.rect(), background)
+        painter.setPen(QPen(foreground, 1))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+
+        drop_rect = self.rect().adjusted(self.width() - 22, 0, 0, -1)
+        painter.drawLine(drop_rect.left(), drop_rect.top(), drop_rect.left(), drop_rect.bottom())
+        painter.drawText(
+            self.rect().adjusted(4, 0, -26, 0),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            self.currentText(),
+        )
+
+        arrow_option = QStyleOption()
+        arrow_option.rect = drop_rect.adjusted(6, 6, -6, -6)
+        arrow_option.palette = self.palette()
+        arrow_option.state = QStyle.StateFlag.State_Enabled
+        self.style().drawPrimitive(
+            QStyle.PrimitiveElement.PE_IndicatorArrowDown,
+            arrow_option,
+            painter,
+            self,
+        )
+        painter.end()
+
+
+class EffectRow(QWidget):
+    focused = pyqtSignal()
+    changed = pyqtSignal()
+
+    def __init__(self, state: EffectState, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.state = state
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 2, 6, 2)
+        layout.setSpacing(8)
+        self.label: QLabel | None = None
+        self.mode_combo: QComboBox | None = None
+        if state.effect_id == "filter":
+            self.mode_combo = EffectModeComboBox()
+            self.mode_combo.addItem("Low-pass Filter", "low_pass")
+            self.mode_combo.addItem("Band-pass Filter", "band_pass")
+        elif state.effect_id == "modulation":
+            self.mode_combo = EffectModeComboBox()
+            self.mode_combo.addItem("Chorus", "chorus")
+            self.mode_combo.addItem("Phaser", "phaser")
+        if self.mode_combo is not None:
+            self.mode_combo.setMinimumWidth(190)
+            self.mode_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.mode_combo.setStyleSheet(
+                "QComboBox { background: palette(base); color: palette(text); "
+                "selection-background-color: palette(base); selection-color: palette(text); }"
+                "QComboBox:focus { background: palette(base); color: palette(text); }"
+                "QComboBox QAbstractItemView { selection-background-color: palette(base); "
+                "selection-color: palette(text); }"
+            )
+            combo_palette = self.mode_combo.palette()
+            for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+                combo_palette.setColor(
+                    group,
+                    QPalette.ColorRole.Highlight,
+                    combo_palette.color(group, QPalette.ColorRole.Base),
+                )
+                combo_palette.setColor(
+                    group,
+                    QPalette.ColorRole.HighlightedText,
+                    combo_palette.color(group, QPalette.ColorRole.Text),
+                )
+            self.mode_combo.setPalette(combo_palette)
+            index = self.mode_combo.findData(state.mode)
+            self.mode_combo.setCurrentIndex(max(0, index))
+            self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+            self.mode_combo.activated.connect(lambda _index: self.focused.emit())
+            layout.addWidget(self.mode_combo)
+        else:
+            self.label = QLabel(EFFECT_LABELS[state.effect_id])
+            self.label.setMinimumWidth(190)
+            layout.addWidget(self.label)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.slider.setRange(-100, 100)
+        self.slider.setValue(state.amount)
+        self.slider.sliderPressed.connect(self.focused.emit)
+        self.slider.valueChanged.connect(self._amount_changed)
+        layout.addWidget(self.slider, 1)
+        self.value_label = QLabel(f"{state.amount:+d}")
+        self.value_label.setFixedWidth(38)
+        self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self.value_label)
+
+    def _amount_changed(self, value: int) -> None:
+        self.state.amount = value
+        self.value_label.setText(f"{value:+d}")
+        self.changed.emit()
+
+    def _mode_changed(self, _index: int) -> None:
+        if self.mode_combo is not None:
+            self.state.mode = str(self.mode_combo.currentData() or "")
+        self.changed.emit()
+
+    def mousePressEvent(self, event) -> None:
+        self.focused.emit()
+        super().mousePressEvent(event)
+
+
+class PhysicalDial(QDial):
+    """Transparent physical-style dial with an outlined ring and marker."""
+
+    def __init__(self, parent: QWidget | None = None, drag_pixels_per_step: float = 12.0) -> None:
+        super().__init__(parent)
+        self.setWrapping(False)
+        self.drag_pixels_per_step = max(1.0, float(drag_pixels_per_step))
+        self._drag_start_y: float | None = None
+        self._drag_start_value = 0
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            self._drag_start_y = event.position().y()
+            self._drag_start_value = self.value()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_start_y is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            # Use bounded vertical drag semantics instead of Qt's circular
+            # mouse tracking, so crossing the top/bottom never wraps.
+            delta = self._drag_start_y - event.position().y()
+            steps = int(round(delta / self.drag_pixels_per_step))
+            value = max(self.minimum(), min(self.maximum(), self._drag_start_value + steps))
+            self.setSliderPosition(value)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_start_y is not None:
+            self._drag_start_y = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor("#ff7a00")
+        bounds = self.rect().adjusted(7, 7, -7, -7)
+        center = QPointF(bounds.center())
+        radius = min(bounds.width(), bounds.height()) / 2.0
+
+        painter.setPen(QPen(color, 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(center, radius, radius)
+
+        ratio = (self.sliderPosition() - self.minimum()) / max(1, self.maximum() - self.minimum())
+        # Sweep from the lower-left through 12 o'clock to the lower-right.
+        # This puts a neutral value at the physical-looking top position.
+        angle = np.deg2rad(135.0 + ratio * 270.0)
+        marker_start = radius * 0.18
+        marker_end = radius * 0.72
+        start = center + QPointF(float(np.cos(angle) * marker_start), float(np.sin(angle) * marker_start))
+        end = center + QPointF(float(np.cos(angle) * marker_end), float(np.sin(angle) * marker_end))
+        painter.setPen(QPen(color, 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(start, end)
+        painter.end()
+
+
+class KnobControl(QWidget):
+    changed = pyqtSignal()
+
+    def __init__(
+        self,
+        label: str,
+        minimum: int,
+        maximum: int,
+        value: int,
+        formatter: Callable[[int], str],
+        parent: QWidget | None = None,
+        drag_pixels_per_step: float = 12.0,
+    ) -> None:
+        super().__init__(parent)
+        self.formatter = formatter
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(2)
+        title = QLabel(label)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        self.dial = PhysicalDial(drag_pixels_per_step=drag_pixels_per_step)
+        self.dial.setRange(minimum, maximum)
+        self.dial.setValue(value)
+        self.dial.setNotchesVisible(True)
+        self.dial.setWrapping(False)
+        self.dial.setFixedSize(76, 76)
+        self.dial.setToolTip(f"{label}: {formatter(value)}")
+        self.dial.valueChanged.connect(self._value_changed)
+        layout.addWidget(self.dial, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.value_label = QLabel(formatter(value))
+        self.value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.value_label)
+
+    def _value_changed(self, value: int) -> None:
+        rendered = self.formatter(value)
+        self.value_label.setText(rendered)
+        self.dial.setToolTip(f"{self.layout().itemAt(0).widget().text()}: {rendered}")
+        self.changed.emit()
+
+    def value(self) -> int:
+        return self.dial.value()
+
+    def setValue(self, value: int) -> None:
+        self.dial.setValue(value)
+
+
+class EffectsPanel(QWidget):
+    """Reorderable effect chain for the active Samples-tab editor audio."""
+
+    exported = pyqtSignal(object)
+
+    def __init__(self, sample_library: SampleLibrary, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.sample_library = sample_library
+        self.source_samples = np.array([], dtype=np.float32)
+        self.source_rate = 44100
+        self.source_name = ""
+        self.selection = (0, 0)
+        self.chain = default_chain()
+        self.octave = 0
+        self.key = 0
+        self.speed_percent = 100
+        self.formant_preservation = False
+        self._render_serial = 0
+        self._render_workers: list[EffectRenderWorker] = []
+        self._preview_dir = Path(tempfile.mkdtemp(prefix="effects-preview-"))
+        self._presets: dict[str, list[dict[str, object]]] = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        self.source_label = QLabel("Select an audio file in Samples")
+        header.addWidget(self.source_label, 1)
+        self.status_label = QLabel("All effects bypassed")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.status_label)
+        layout.addLayout(header)
+
+        self.waveform = WaveformWidget()
+        self.waveform.setMinimumHeight(120)
+        self.waveform.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(self.waveform, 1)
+
+        self.preview_player = PreviewPlayer(self)
+        self.preview_player.setVisible(False)
+        self.preview_player.playhead_changed.connect(self.waveform.set_playhead)
+        self.waveform.playhead_requested.connect(self.preview_player.seek_absolute)
+
+        transport = QHBoxLayout()
+        self.rewind_start_button = self._icon_button("Skip to beginning", "skip-start.svg")
+        self.rewind_button = self._icon_button("Rewind 5 seconds", "rewind.svg")
+        self.play_button = self._icon_button("Play", "play.svg")
+        self.forward_button = self._icon_button("Fast-forward 5 seconds", "fast-forward.svg")
+        self.skip_end_button = self._icon_button("Skip to end", "skip-end.svg")
+        self.stop_button = self._icon_button("Stop", "stop.svg")
+        self.pause_button = self._icon_button("Pause", "pause.svg")
+        self.rewind_start_button.clicked.connect(self.preview_player._rewind_to_start)
+        self.rewind_button.clicked.connect(lambda: self.preview_player._seek_relative(-5000))
+        self.play_button.clicked.connect(self.preview_player._play)
+        self.forward_button.clicked.connect(lambda: self.preview_player._seek_relative(5000))
+        self.skip_end_button.clicked.connect(self.preview_player._skip_to_end)
+        self.stop_button.clicked.connect(self.preview_player._stop)
+        self.pause_button.clicked.connect(self.preview_player._pause)
+        for button in (
+            self.rewind_start_button,
+            self.rewind_button,
+            self.play_button,
+            self.forward_button,
+            self.skip_end_button,
+            self.stop_button,
+            self.pause_button,
+        ):
+            transport.addWidget(button)
+        transport.addStretch()
+        self.save_effected_button = ThemedTextButton("Save effected WAV")
+        self.save_effected_button.clicked.connect(self.save_effected)
+        self.save_effected_button.setEnabled(False)
+        transport.addWidget(self.save_effected_button)
+        layout.addLayout(transport)
+
+        transform_group = QGroupBox("Pitch / Time")
+        transform_layout = QHBoxLayout(transform_group)
+        transform_layout.setContentsMargins(4, 4, 4, 4)
+        self.octave_knob = KnobControl("Octave", -4, 4, 0, lambda value: f"{value:+d}")
+        self.key_knob = KnobControl("Key", -12, 12, 0, lambda value: f"{value:+d} st")
+        self.speed_knob = KnobControl(
+            "Speed",
+            25,
+            200,
+            100,
+            lambda value: f"{value / 100.0:.2f}x",
+            drag_pixels_per_step=8.0,
+        )
+        for knob in (self.octave_knob, self.key_knob, self.speed_knob):
+            knob.changed.connect(self._transform_changed)
+            transform_layout.addWidget(knob)
+        transform_layout.addStretch()
+        self.formant_checkbox = OrangeCheckBox("Preserve formants")
+        self.formant_checkbox.toggled.connect(self._formant_changed)
+        transform_layout.addWidget(self.formant_checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(transform_group)
+
+        chain_group = QGroupBox("Effect chain")
+        chain_layout = QVBoxLayout(chain_group)
+        chain_layout.setContentsMargins(4, 4, 4, 4)
+        self.chain_list = QListWidget()
+        self.chain_list.setObjectName("effectsChainList")
+        self.chain_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.chain_list.setFrameShape(QFrame.Shape.NoFrame)
+        self.chain_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.chain_list.setStyleSheet(
+            "QListWidget#effectsChainList::item:hover, "
+            "QListWidget#effectsChainList::item:selected, "
+            "QListWidget#effectsChainList::item:selected:active, "
+            "QListWidget#effectsChainList::item:selected:!active { background: transparent; "
+            "color: palette(text); border: none; outline: none; }"
+            "QListWidget#effectsChainList::item:focus { outline: none; border: none; }"
+        )
+        self.chain_list.currentRowChanged.connect(self._chain_row_selected)
+        chain_layout.addWidget(self.chain_list, 1)
+        chain_controls = QHBoxLayout()
+        self.move_up_button = QPushButton("Move Up")
+        self.move_down_button = QPushButton("Move Down")
+        self.move_up_button.clicked.connect(lambda: self._move_selected(-1))
+        self.move_down_button.clicked.connect(lambda: self._move_selected(1))
+        chain_controls.addWidget(self.move_up_button)
+        chain_controls.addWidget(self.move_down_button)
+        chain_controls.addStretch()
+        chain_layout.addLayout(chain_controls)
+        layout.addWidget(chain_group, 2)
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Preset"))
+        self.preset_name = QLineEdit()
+        self.preset_name.setPlaceholderText("Preset name")
+        preset_row.addWidget(self.preset_name, 1)
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(180)
+        preset_row.addWidget(self.preset_combo)
+        self.save_preset_button = QPushButton("Save")
+        self.load_preset_button = QPushButton("Load")
+        self.delete_preset_button = QPushButton("Delete")
+        self.save_preset_button.clicked.connect(self._save_preset)
+        self.load_preset_button.clicked.connect(self._load_preset)
+        self.delete_preset_button.clicked.connect(self._delete_preset)
+        preset_row.addWidget(self.save_preset_button)
+        preset_row.addWidget(self.load_preset_button)
+        preset_row.addWidget(self.delete_preset_button)
+        layout.addLayout(preset_row)
+
+        self.render_timer = QTimer(self)
+        self.render_timer.setSingleShot(True)
+        self.render_timer.setInterval(140)
+        self.render_timer.timeout.connect(self._start_render)
+        self._rebuild_chain()
+        self._load_presets()
+
+    def _icon_button(self, name: str, icon_name: str) -> QPushButton:
+        button = ThemedIconButton()
+        button.setFixedSize(30, 30)
+        button.setIcon(bundled_icon(icon_name))
+        button.setIconSize(QSize(18, 18))
+        button.setToolTip(name)
+        button.setAccessibleName(name)
+        return button
+
+    def _rebuild_chain(self, selected_row: int = 0) -> None:
+        self.chain_list.clear()
+        for state in self.chain:
+            item = QListWidgetItem(self.chain_list)
+            row = EffectRow(state)
+            row.focused.connect(lambda row_item=item: self.chain_list.setCurrentItem(row_item))
+            row.changed.connect(self._schedule_render)
+            item.setSizeHint(row.sizeHint())
+            self.chain_list.addItem(item)
+            self.chain_list.setItemWidget(item, row)
+        if self.chain:
+            self.chain_list.setCurrentRow(max(0, min(selected_row, len(self.chain) - 1)))
+        self._chain_row_selected(self.chain_list.currentRow())
+
+    def _chain_row_selected(self, row: int) -> None:
+        self.move_up_button.setEnabled(row > 0)
+        self.move_down_button.setEnabled(0 <= row < len(self.chain) - 1)
+
+    def _move_selected(self, direction: int) -> None:
+        row = self.chain_list.currentRow()
+        target = row + direction
+        if row < 0 or target < 0 or target >= len(self.chain):
+            return
+        self.chain[row], self.chain[target] = self.chain[target], self.chain[row]
+        self._rebuild_chain(target)
+        self._schedule_render()
+
+    def set_source(self, samples: np.ndarray, sample_rate: int, name: str) -> None:
+        self.source_samples = np.asarray(samples, dtype=np.float32).reshape(-1).copy()
+        self.source_rate = max(1, int(sample_rate))
+        self.source_name = name
+        self.selection = (0, len(self.source_samples))
+        self.source_label.setText(name or "Select an audio file in Samples")
+        self._schedule_render()
+
+    def set_selection(self, start: int, end: int) -> None:
+        total = len(self.source_samples)
+        self.selection = (max(0, min(total, start)), max(0, min(total, end)))
+        self._schedule_render()
+
+    def _transform_changed(self) -> None:
+        self.octave = self.octave_knob.value()
+        self.key = self.key_knob.value()
+        self.speed_percent = self.speed_knob.value()
+        self._schedule_render()
+
+    def _formant_changed(self, enabled: bool) -> None:
+        self.formant_preservation = enabled
+        self._schedule_render()
+
+    def _schedule_render(self) -> None:
+        self.render_timer.start()
+
+    def _start_render(self) -> None:
+        self._render_serial += 1
+        serial = self._render_serial
+        start, end = self.selection
+        samples = self.source_samples[start:end].copy()
+        if not samples.size:
+            self.waveform.set_samples(np.array([], dtype=np.float32), self.source_rate)
+            self.preview_player.set_file(None)
+            self.save_effected_button.setEnabled(False)
+            self.status_label.setText("Select an audio file in Samples")
+            return
+        worker = EffectRenderWorker(
+            serial,
+            samples,
+            self.source_rate,
+            [EffectState(item.effect_id, item.amount, item.mode) for item in self.chain],
+            self.octave,
+            self.key,
+            self.speed_percent / 100.0,
+            self.formant_preservation,
+        )
+        worker.rendered.connect(self._render_finished)
+        worker.failed.connect(self._render_failed)
+        worker.finished.connect(lambda worker=worker: self._forget_worker(worker))
+        self._render_workers.append(worker)
+        self.status_label.setText("Rendering effects...")
+        worker.start()
+
+    def _forget_worker(self, worker: EffectRenderWorker) -> None:
+        if worker in self._render_workers:
+            self._render_workers.remove(worker)
+        worker.deleteLater()
+
+    def _render_finished(self, serial: int, samples: np.ndarray, sample_rate: int) -> None:
+        if serial != self._render_serial:
+            return
+        self.waveform.set_samples(samples, sample_rate)
+        preview_path = self._preview_dir / "effects-preview.wav"
+        write_wav(preview_path, samples, sample_rate)
+        self.preview_player.set_file(preview_path)
+        self.save_effected_button.setEnabled(True)
+        self.status_label.setText("Preview ready")
+
+    def _render_failed(self, serial: int, message: str) -> None:
+        if serial == self._render_serial:
+            self.status_label.setText(f"Effect render failed: {message}")
+            self.save_effected_button.setEnabled(False)
+
+    def _preset_path(self) -> Path:
+        return app_config_dir() / "effects-presets.json"
+
+    def _load_presets(self) -> None:
+        try:
+            loaded = json.loads(self._preset_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = {}
+        self._presets = loaded if isinstance(loaded, dict) else {}
+        self.preset_combo.clear()
+        self.preset_combo.addItems(sorted(self._presets, key=str.casefold))
+
+    def _save_presets(self) -> None:
+        path = self._preset_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(self._presets, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError as exc:
+            self.status_label.setText(f"Could not save presets: {exc}")
+
+    def _save_preset(self) -> None:
+        name = self.preset_name.text().strip()
+        if not name:
+            self.status_label.setText("Enter a preset name")
+            return
+        self._presets[name] = {
+            "version": 2,
+            "chain": [state.to_dict() for state in self.chain],
+            "octave": self.octave,
+            "key": self.key,
+            "speed_percent": self.speed_percent,
+            "formant_preservation": self.formant_preservation,
+        }
+        self._save_presets()
+        self._load_presets()
+        self.preset_combo.setCurrentText(name)
+        self.status_label.setText(f"Saved preset: {name}")
+
+    def _load_preset(self) -> None:
+        name = self.preset_combo.currentText().strip()
+        record = self._presets.get(name)
+        if not record:
+            return
+        if isinstance(record, list):
+            # Presets created by the first Effects implementation contained
+            # only the effect chain; keep them loadable after adding knobs.
+            self.chain = chain_from_dicts(record)
+            octave = 0
+            key = 0
+            speed_percent = 100
+            formant_preservation = False
+        elif isinstance(record, dict):
+            self.chain = chain_from_dicts(record.get("chain"))
+            try:
+                octave = max(-4, min(4, int(record.get("octave", 0))))
+                key = max(-12, min(12, int(record.get("key", 0))))
+                speed_percent = max(25, min(200, int(record.get("speed_percent", 100))))
+            except (TypeError, ValueError):
+                octave, key, speed_percent = 0, 0, 100
+            formant_preservation = bool(record.get("formant_preservation", False))
+        else:
+            return
+        self.octave = octave
+        self.key = key
+        self.speed_percent = speed_percent
+        self.formant_preservation = formant_preservation
+        for knob, value in (
+            (self.octave_knob, octave),
+            (self.key_knob, key),
+            (self.speed_knob, speed_percent),
+        ):
+            blocker = QSignalBlocker(knob.dial)
+            knob.setValue(value)
+            del blocker
+        blocker = QSignalBlocker(self.formant_checkbox)
+        self.formant_checkbox.setChecked(formant_preservation)
+        del blocker
+        self.preset_name.setText(name)
+        self._rebuild_chain()
+        self._schedule_render()
+        self.status_label.setText(f"Loaded preset: {name}")
+
+    def _delete_preset(self) -> None:
+        name = self.preset_combo.currentText().strip()
+        if not name or name not in self._presets:
+            return
+        self._presets.pop(name, None)
+        self._save_presets()
+        self._load_presets()
+        self.status_label.setText(f"Deleted preset: {name}")
+
+    def save_effected(self) -> None:
+        if not self.source_samples.size:
+            return
+        start, end = self.selection
+        source_stem = safe_folder_name(Path(self.source_name or "sample").stem)
+        default = self.sample_library.trimmed_dir / f"{source_stem} - effected.wav"
+        destination = choose_save_path(self, "Save effected WAV", default, "WAV files (*.wav)")
+        if destination is None or not confirm_overwrite(self, Path(destination)):
+            return
+        try:
+            transformed = process_time_pitch(
+                self.source_samples[start:end],
+                self.source_rate,
+                self.octave,
+                self.key,
+                self.speed_percent / 100.0,
+                self.formant_preservation,
+            )
+            rendered = process_chain(transformed, self.source_rate, self.chain)
+            write_wav(Path(destination), rendered, self.source_rate)
+            self.sample_library.add_trimmed(Path(destination))
+        except (OSError, RuntimeError, ValueError) as exc:
+            show_message(self, "Could not save effected sample", str(exc))
+            return
+        self.exported.emit(Path(destination))
+        self.status_label.setText(f"Saved {Path(destination).name}")
+
+    def close_panel(self) -> None:
+        self.render_timer.stop()
+        self.preview_player.close_player()
+        for worker in list(self._render_workers):
+            worker.requestInterruption()
+            worker.wait(1500)
+        shutil.rmtree(self._preview_dir, ignore_errors=True)
 
 
 @dataclass
@@ -3021,7 +3694,7 @@ class AudioSplitter(QMainWindow):
 
         self.setWindowTitle(APP_NAME)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
-        self.resize(1120, 760)
+        self.resize(1120, 860)
         self.setMinimumSize(800, 600)
         self.setAcceptDrops(True)
 
@@ -3106,12 +3779,18 @@ class AudioSplitter(QMainWindow):
 
         tabs = QTabWidget()
         self.tabs = tabs
-        tabs.addTab(self._build_samples_page(), "Samples")
+        samples_page = self._build_samples_page()
+        tabs.addTab(samples_page, "Samples")
         splitter_page = QWidget()
         splitter_layout = QVBoxLayout(splitter_page)
         splitter_layout.setContentsMargins(8, 8, 8, 8)
         splitter_layout.setSpacing(10)
         tabs.addTab(splitter_page, "Stem Splitter")
+        self.effects_panel = EffectsPanel(self.sample_library)
+        self.effects_panel.exported.connect(self._effects_saved)
+        tabs.addTab(self.effects_panel, "Effects")
+        self.waveform_editor.samples_changed.connect(self.effects_panel.set_source)
+        self.waveform_editor.selection_changed.connect(self.effects_panel.set_selection)
         page.addWidget(tabs)
 
         source = QGroupBox("Source track")
@@ -3182,6 +3861,11 @@ class AudioSplitter(QMainWindow):
         export_layout.addWidget(self.folder_export_button)
         splitter_layout.addWidget(export_panel)
         self._style_tabs()
+
+    def _effects_saved(self, path: Path) -> None:
+        self.samples_status.setText(f"Saved {path.name}")
+        if self.showing_library:
+            self._populate_library_tree()
 
     def _style_tabs(self) -> None:
         background = "#ffffff" if self.light_mode else "#000000"
@@ -4356,6 +5040,7 @@ class AudioSplitter(QMainWindow):
             card.close_player()
         self.recording_panel.close_recording()
         self.preview_player.close_player()
+        self.effects_panel.close_panel()
         self.waveform_editor.close_editor()
         if self.split_thread and self.split_thread.isRunning():
             self.split_thread.terminate()
@@ -4678,10 +5363,13 @@ def apply_style(app: QApplication, light_mode: bool = False) -> None:
             height: 6px;
         }}
         QSlider::handle:horizontal {{
-            background: #ffffff;
-            border: 1px solid #000000;
+            background: #ff7a00;
+            border: 1px solid #ff7a00;
             width: 12px;
             margin: -5px 0;
+        }}
+        QSlider:focus {{
+            outline: none;
         }}
         QCheckBox::indicator {{
             width: 14px;

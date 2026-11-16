@@ -19,7 +19,7 @@ dependencies = [
 stemkart = "main:main"
 
 [tool.setuptools]
-py-modules = ["main"]
+py-modules = ["main", "effects"]
 
 [tool.setuptools.data-files]
 "share/stemkart/icons" = ["icons/*.svg"]
