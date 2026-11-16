@@ -12,7 +12,7 @@ StemKart keeps audio on the local machine while providing a two-pane sample brow
 
 ### Standalone Linux release
 
-For a released build, download the latest standalone artifact from the [GitHub Releases page](https://github.com/seanbman/stemkart/releases).
+For a released build, download the latest standalone Debian package from the [GitHub Releases page](https://github.com/seanbman/stemkart/releases).
 
 #### Debian or Ubuntu package
 
@@ -24,16 +24,7 @@ sudo apt install ./stemkart_*.deb
 
 The package installs StemKart, its bundled runtime files, the application icon, and a desktop entry. StemKart then appears in the Applications menu and the running window can be grouped under the StemKart icon in the dock. Pinning it to favorites remains an optional desktop preference.
 
-#### AppImage
-
-Make the downloaded AppImage executable and launch it:
-
-```bash
-chmod +x StemKart-*.AppImage
-./StemKart-*.AppImage
-```
-
-The AppImage is portable. Desktop-menu integration is provided by the `.deb` package or by an AppImage integration tool.
+An AppImage is not published yet. The current beta release uses the `.deb` format for standard Ubuntu/Debian menu and dock integration.
 
 ### From source
 

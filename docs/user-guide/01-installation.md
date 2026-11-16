@@ -12,14 +12,9 @@ For Ubuntu or Debian, install the `.deb` package:
 sudo apt install ./stemkart_*.deb
 ```
 
-The package provides the application, desktop-menu entry, icon, and bundled release runtime. Open StemKart from the Applications menu. To keep it in the dock, right-click its running icon and choose **Add to Favorites**.
+The package provides the application, desktop-menu entry, icon, bundled Python/Qt/Demucs runtime, FFmpeg, and Rubber Band. Open StemKart from the Applications menu. To keep it in the dock, right-click its running icon and choose **Add to Favorites**.
 
-For a portable AppImage:
-
-```bash
-chmod +x StemKart-*.AppImage
-./StemKart-*.AppImage
-```
+The beta release currently publishes a `.deb`; a portable AppImage is planned separately.
 
 ## 1.2 Source checkout
 
