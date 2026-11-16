@@ -5,5 +5,5 @@ Comment=Split, record, and organize audio locally
 Exec=stemkart
 Icon=stemkart
 Terminal=false
-Categories=AudioVideo;Audio;Utility;
+Categories=AudioVideo;
 StartupWMClass=stemkart

@@ -16,4 +16,4 @@ For a system installation, copy `icons/hicolor/` contents into `/usr/share/icons
 
 For an AppImage AppDir, place `stemkart.desktop` and `stemkart.png` (512×512) at the AppDir root; the icon filename must match the `Icon=stemkart` desktop entry. An optional `.DirIcon` symlink can point to `stemkart.png`.
 
-These are prepared assets only: no application code, desktop-launcher entry, or CI changes are implied. PNG files have real alpha transparency outside the rounded white tile, and no baked checkerboard.
+For a per-user desktop installation from this checkout, run `./packaging/linux/install_desktop.sh`. It installs the local `.venv` launcher, desktop entry, and all icon sizes under `~/.local/share/`. PNG files have real alpha transparency outside the rounded white tile, and no baked checkerboard.

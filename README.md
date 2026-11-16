@@ -1,35 +1,96 @@
-# StemKart
+<p align="center">
+  <img src="packaging/linux/icons/hicolor/256x256/apps/stemkart.png" alt="StemKart icon" width="128">
+</p>
 
-StemKart is a local PyQt6 desktop app for recording, organizing samples, and splitting one music track into four WAV stems with Demucs:
+<h1 align="center">StemKart</h1>
 
-- vocals
-- drums
-- bass
-- other
+<p align="center">A local Linux desktop app for recording, organizing, editing, and splitting audio.</p>
 
-The interface uses a bundled IBM Plex Sans typeface and a strict black-and-white visual theme. In-app icons retain their existing shapes and are rendered in white; the waveform is the focused editing surface, with an orange signal, a red playback line, and white trim markers. The title bar includes an optional Light mode toggle that inverts the black-and-white surfaces and icons while retaining the waveform accents; the selected mode is remembered in the application config. The Linux launcher artwork is kept separate.
+StemKart keeps audio on the local machine while providing a two-pane sample browser, persistent file references, recording, waveform trimming, Demucs stem splitting, and a reorderable effects chain.
 
-The Samples tab provides a two-pane disk browser, persistent external references, optional copies into a local library, recording, preview playback, and waveform-based trimming to new WAV files. On Linux with PipeWire, the recording source can be a microphone, the monitor of a playback device, or an active application's audio stream. The Stem Splitter tab has playback for every stem and three export choices: save one stem, put every stem directly into an existing folder, or create a new named folder containing every stem.
+## Installation
 
-The Effects tab applies a reorderable chain of high-pass EQ, filtering, compression, transient shaping, saturation, modulation, delay, and reverb to the active Samples-tab editor selection. Effect chains can be saved as named local presets and exported as new WAV files in the trimmed sample library.
+### Standalone Linux release
 
-## Setup
+For a released build, download the latest standalone artifact from the [GitHub Releases page](https://github.com/seanbman/stemkart/releases).
 
-FFmpeg, the Rubber Band CLI (`rubberband`), and Python 3.10+ are required. Linux system-audio and per-application recording additionally use the `pw-dump`, `pw-record`, and `pw-link` commands from PipeWire. The setup below uses the CPU-only PyTorch wheel so it does not install CUDA/NVIDIA packages:
+#### Debian or Ubuntu package
+
+Install the downloaded `.deb` with Ubuntu Software or from a terminal:
 
 ```bash
+sudo apt install ./stemkart_*.deb
+```
+
+The package installs StemKart, its bundled runtime files, the application icon, and a desktop entry. StemKart then appears in the Applications menu and the running window can be grouped under the StemKart icon in the dock. Pinning it to favorites remains an optional desktop preference.
+
+#### AppImage
+
+Make the downloaded AppImage executable and launch it:
+
+```bash
+chmod +x StemKart-*.AppImage
+./StemKart-*.AppImage
+```
+
+The AppImage is portable. Desktop-menu integration is provided by the `.deb` package or by an AppImage integration tool.
+
+### From source
+
+Source installation is intended for development or for users who want to run the checkout directly. Python 3.10+, `uv`, FFmpeg, Rubber Band, and the PipeWire tools are required for the corresponding features.
+
+```bash
+git clone https://github.com/seanbman/stemkart.git
+cd stemkart
 uv venv
 uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
-Run it with:
+Run the application:
 
 ```bash
 .venv/bin/python main.py
 ```
 
-The first split downloads the Demucs model and may take a few minutes. Generated stems are held in a temporary directory until the app closes; use one of the export buttons to keep them. Sample-library metadata and copied/trimmed/recorded files are stored locally under the platform's application-data directory (on Linux, normally `~/.local/share/stemkart/samples/`), while global settings such as the theme are stored under the platform's config directory (on Linux, normally `~/.config/stemkart/settings.json`). Referenced source files stay in their original locations. The Library view mirrors folders under that local `samples/` directory, so folders and audio files added manually are detected with Refresh or when the Library view is opened. Library folders can be created and renamed in the app; only empty user-created folders can be deleted. StemKart does not upload audio files.
+To add the checked-out application to the current user's menu and dock identity, install the development desktop entry:
 
-## Notes
+```bash
+./packaging/linux/install_desktop.sh
+```
 
-The window is intentionally fixed-size and uses no scrollable panels. The default model is Demucs `htdemucs`, which produces the four stems above.
+This launcher points at the checkout's `.venv`; it is not a replacement for the standalone release package.
+
+## User guide
+
+Start with the [User guide index](docs/user-guide/README.md). It is organized as a numbered walkthrough:
+
+1. [Installation and first launch](docs/user-guide/01-installation.md)
+2. [Samples and the Explorer](docs/user-guide/02-samples.md)
+3. [Library and References](docs/user-guide/03-library.md)
+4. [Stem Splitter](docs/user-guide/04-stem-splitter.md)
+5. [Effects](docs/user-guide/05-effects.md)
+6. [Recording](docs/user-guide/06-recording.md)
+7. [Troubleshooting](docs/user-guide/07-troubleshooting.md)
+
+## Developer documentation
+
+The [Developer documentation index](docs/developer/README.md) covers the project setup, architecture, tests, packaging, and license notices:
+
+1. [Development setup](docs/developer/01-development-setup.md)
+2. [Architecture](docs/developer/02-architecture.md)
+3. [Testing](docs/developer/03-testing.md)
+4. [Packaging and release](docs/developer/04-packaging.md)
+5. [Licenses and third-party notices](docs/developer/05-licenses-and-notices.md)
+
+## Project notes
+
+- Audio remains local; StemKart does not upload source files.
+- Demucs model downloads happen on the first split and may take several minutes.
+- The default Demucs model is `htdemucs`, producing vocals, drums, bass, and other stems.
+- The application uses a fixed-size, native Qt-oriented interface with no scrollable panels.
+
+## License
+
+StemKart is intended to be distributed under the GNU General Public License, version 3. The source distribution also includes separate notices for bundled or required third-party software; see the [license and notices guide](docs/developer/05-licenses-and-notices.md).
+
+<p align="center"><a href="docs/user-guide/README.md">User guide</a> · <a href="docs/developer/README.md">Developer documentation</a></p>
