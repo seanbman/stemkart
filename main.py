@@ -2889,6 +2889,11 @@ def style_dialog(dialog: QDialog) -> None:
         return
 
     dialog.setWindowFlags(dialog.windowFlags() | Qt.WindowType.FramelessWindowHint)
+    application = QApplication.instance()
+    theme_stylesheets = getattr(application, "_stemkart_theme_stylesheets", {}) if application else {}
+    current_stylesheet = theme_stylesheets.get(bool(getattr(application, "_stemkart_light_mode", False)))
+    if current_stylesheet:
+        dialog.setStyleSheet(current_stylesheet)
     dialog.setSizeGripEnabled(False)
     minimum_width = 300
     if isinstance(dialog, QMessageBox):
@@ -2901,7 +2906,6 @@ def style_dialog(dialog: QDialog) -> None:
     title_bar = DarkTitleBar(dialog, dialog=True)
     dialog._stemkart_title_bar = title_bar
     if isinstance(dialog, QFileDialog):
-        application = QApplication.instance()
         foreground = application.palette().text().color().name() if application else "#ffffff"
         icon_provider = MonochromeIconProvider(foreground)
         dialog.setIconProvider(icon_provider)
@@ -3053,6 +3057,13 @@ class AudioSplitter(QMainWindow):
         if application is None:
             return
         apply_style(application, light_mode=self.light_mode)
+        theme_stylesheets = getattr(application, "_stemkart_theme_stylesheets", {})
+        current_stylesheet = theme_stylesheets.get(self.light_mode)
+        if current_stylesheet:
+            # Re-polish only StemKart's window subtree. Replacing the
+            # application-wide stylesheet repolishes every row in large
+            # QListWidgets and causes multi-second theme changes.
+            self.main_frame.setStyleSheet(current_stylesheet)
         foreground = application.palette().text().color().name()
         for button in self.findChildren(QPushButton):
             if isinstance(button, ThemedIconButton):
@@ -4428,7 +4439,9 @@ def apply_style(app: QApplication, light_mode: bool = False) -> None:
     """Apply StemKart's black-and-white theme in dark or inverted light mode."""
     app._stemkart_light_mode = light_mode
     app.styleHints().setColorScheme(Qt.ColorScheme.Light if light_mode else Qt.ColorScheme.Dark)
-    app.setStyle("Fusion")
+    if not getattr(app, "_stemkart_style_initialized", False):
+        app.setStyle("Fusion")
+        app._stemkart_style_initialized = True
 
     background = QColor(255, 255, 255) if light_mode else QColor(0, 0, 0)
     foreground = QColor(0, 0, 0) if light_mode else QColor(255, 255, 255)
@@ -4460,10 +4473,13 @@ def apply_style(app: QApplication, light_mode: bool = False) -> None:
     palette.setColor(disabled, QPalette.ColorRole.HighlightedText, background)
     app.setPalette(palette)
 
-    family = load_bundled_font()
-    font = QFont(family, 10)
-    font.setStyleHint(QFont.StyleHint.SansSerif)
-    app.setFont(font)
+    family = getattr(app, "_stemkart_font_family", None) or load_bundled_font()
+    if not getattr(app, "_stemkart_font_initialized", False):
+        font = QFont(family, 10)
+        font.setStyleHint(QFont.StyleHint.SansSerif)
+        app.setFont(font)
+        app._stemkart_font_family = family
+        app._stemkart_font_initialized = True
 
     split_background = "#ff7a00"
     split_foreground = "#000000"
@@ -4724,25 +4740,15 @@ def apply_style(app: QApplication, light_mode: bool = False) -> None:
         }}
         """
     if light_mode:
-        stylesheet = stylesheet.replace("#000000", "__STEMKART_BLACK__").replace("#ffffff", "#000000").replace("__STEMKART_BLACK__", "#ffffff")
+        stylesheet = stylesheet.replace(
+            "#000000", "__STEMKART_BLACK__"
+        ).replace("#ffffff", "#000000").replace("__STEMKART_BLACK__", "#ffffff")
         stylesheet += """
         QPushButton#transportButton:hover,
         QPushButton#transportButton:pressed,
-        QPushButton#transportButton:checked {
-            background: #000000;
-            color: #ffffff;
-            border-color: #000000;
-        }
-        QPushButton#transportButton[stemkart_active="true"] {
-            background: #000000;
-            color: #ffffff;
-            border-color: #000000;
-        }
-        QPushButton#markerButton[stemkart_active="true"] {
-            background: #000000;
-            color: #ffffff;
-            border-color: #000000;
-        }
+        QPushButton#transportButton:checked,
+        QPushButton#transportButton[stemkart_active="true"],
+        QPushButton#markerButton[stemkart_active="true"],
         QPushButton#markerButton[stemkart_active="true"]:disabled {
             background: #000000;
             color: #ffffff;
@@ -4753,28 +4759,21 @@ def apply_style(app: QApplication, light_mode: bool = False) -> None:
         stylesheet += """
         QPushButton#transportButton:hover,
         QPushButton#transportButton:pressed,
-        QPushButton#transportButton:checked {
-            background: #ffffff;
-            color: #000000;
-            border-color: #ffffff;
-        }
-        QPushButton#transportButton[stemkart_active="true"] {
-            background: #ffffff;
-            color: #000000;
-            border-color: #ffffff;
-        }
-        QPushButton#markerButton[stemkart_active="true"] {
-            background: #ffffff;
-            color: #000000;
-            border-color: #ffffff;
-        }
+        QPushButton#transportButton:checked,
+        QPushButton#transportButton[stemkart_active="true"],
+        QPushButton#markerButton[stemkart_active="true"],
         QPushButton#markerButton[stemkart_active="true"]:disabled {
             background: #ffffff;
             color: #000000;
             border-color: #ffffff;
         }
         """
-    app.setStyleSheet(stylesheet)
+    theme_stylesheets = getattr(app, "_stemkart_theme_stylesheets", {})
+    theme_stylesheets[light_mode] = stylesheet
+    app._stemkart_theme_stylesheets = theme_stylesheets
+    if not getattr(app, "_stemkart_stylesheet_initialized", False):
+        app.setStyleSheet(stylesheet)
+        app._stemkart_stylesheet_initialized = True
 
 
 def main() -> int:
