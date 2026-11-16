@@ -18,7 +18,7 @@ from typing import Callable
 
 import numpy as np
 
-from PyQt6.QtCore import QFile, QDir, QEvent, QIODevice, QFileInfo, QThread, QTimer, QUrl, Qt, QSize, QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QFile, QDir, QEvent, QIODevice, QFileInfo, QFileSystemWatcher, QSignalBlocker, QThread, QTimer, QUrl, Qt, QSize, QObject, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import (
     QColor,
     QDragEnterEvent,
@@ -42,7 +42,6 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFileIconProvider,
     QGridLayout,
-    QGraphicsDropShadowEffect,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -55,8 +54,10 @@ from PyQt6.QtWidgets import (
     QProxyStyle,
     QPushButton,
     QSlider,
+    QStackedWidget,
     QStyle,
     QStyleOption,
+    QStyleOptionButton,
     QSizePolicy,
     QSizeGrip,
     QTabWidget,
@@ -254,6 +255,107 @@ class ThemedTextButton(QPushButton):
         self._update_active_state()
 
 
+class OrangeCheckBox(QCheckBox):
+    """Stock checkbox geometry with an orange check glyph when enabled."""
+
+    def paintEvent(self, _event) -> None:
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        painter = QPainter(self)
+        indicator = self.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator,
+            option,
+            self,
+        )
+        background = self.palette().color(QPalette.ColorRole.Base)
+        border = self.palette().color(QPalette.ColorRole.Text)
+        painter.fillRect(indicator, background)
+        painter.setPen(QPen(border, 1))
+        painter.drawRect(indicator.adjusted(0, 0, -1, -1))
+        if self.isChecked():
+            painter.setPen(QPen(QColor("#ff7a00"), 2))
+            painter.drawLine(
+                indicator.left() + 3,
+                indicator.top() + indicator.height() // 2,
+                indicator.left() + indicator.width() // 2 - 1,
+                indicator.bottom() - 3,
+            )
+            painter.drawLine(
+                indicator.left() + indicator.width() // 2 - 1,
+                indicator.bottom() - 3,
+                indicator.right() - 3,
+                indicator.top() + 3,
+            )
+        text_rect = option.rect
+        text_rect.setLeft(indicator.right() + 6)
+        self.style().drawItemText(
+            painter,
+            text_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            self.palette(),
+            self.isEnabled(),
+            self.text(),
+            QPalette.ColorRole.Text,
+        )
+
+
+class BarberPoleProgressBar(QProgressBar):
+    """Orange progress fill with a quiet animated white barber-pole pattern."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._stripe_offset = 0
+        self._stripe_timer = QTimer(self)
+        self._stripe_timer.setInterval(55)
+        self._stripe_timer.timeout.connect(self._advance_stripes)
+
+    def _advance_stripes(self) -> None:
+        self._stripe_offset = (self._stripe_offset + 1) % 16
+        self.update()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._stripe_timer.start()
+
+    def hideEvent(self, event) -> None:
+        self._stripe_timer.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+        border = self.rect().adjusted(0, 0, -1, -1)
+        painter.fillRect(border, QColor("#000000"))
+        painter.setPen(QPen(QColor("#ffffff"), 1))
+        painter.drawRect(border)
+
+        inner = border.adjusted(1, 1, -1, -1)
+        if self.maximum() == self.minimum():
+            chunk = inner
+        else:
+            span = self.maximum() - self.minimum()
+            progress = max(0.0, min(1.0, (self.value() - self.minimum()) / span))
+            chunk = inner.adjusted(0, 0, round(-inner.width() * (1.0 - progress)), 0)
+
+        if chunk.width() > 0:
+            painter.fillRect(chunk, QColor("#ff7a00"))
+            painter.save()
+            painter.setClipRect(chunk)
+            stripe_pen = QPen(QColor(255, 255, 255, 105), 1)
+            painter.setPen(stripe_pen)
+            step = 16
+            start = inner.left() - inner.height() - step + self._stripe_offset
+            end = inner.right() + inner.height() + step
+            for x in range(start, end, step):
+                painter.drawLine(x, inner.bottom(), x + inner.height(), inner.top())
+            painter.restore()
+
+        if self.isTextVisible() and self.text():
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(inner, Qt.AlignmentFlag.AlignCenter, self.text())
+
+
 class StemKartSizeGrip(QSizeGrip):
     """A minimal resize affordance without Qt's filled corner square."""
 
@@ -439,76 +541,17 @@ class SampleLibrary:
             "entries": {},
             "last_directory": str(Path.home()),
             "scan_recursive": False,
+            "reference_roots": [],
         }
+        self._reference_cache_dirty = False
         self._load()
-        self.sync_legacy_additions()
+        self._infer_reference_roots()
+        self.register_reference_root(self.legacy_root, recursive=True)
 
     def _migrate_legacy_library(self) -> None:
-        """Copy the old project-local library into the local app-data directory once."""
-        if self.root.exists() or not self.legacy_root.exists():
-            self.root.mkdir(parents=True, exist_ok=True)
-            return
-        if self.root.resolve() == self.legacy_root.resolve():
-            return
-
+        """Create the private metadata root without copying source audio files."""
         self.root.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(self.legacy_root, self.root)
-        metadata_path = self.root / "library.json"
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        if not isinstance(metadata, dict):
-            return
-
-        legacy_root = self.legacy_root.resolve()
-        migrated_root = self.root.resolve()
-
-        def rebase(value: object) -> object:
-            if not isinstance(value, str) or not value:
-                return value
-            candidate = Path(value)
-            try:
-                relative = candidate.resolve().relative_to(legacy_root)
-            except ValueError:
-                return value
-            return str(migrated_root / relative)
-
-        entries = metadata.get("entries")
-        if isinstance(entries, dict):
-            for record in entries.values():
-                if isinstance(record, dict):
-                    record["path"] = rebase(record.get("path"))
-                record["source"] = rebase(record.get("source"))
-        temporary = metadata_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
-        temporary.replace(metadata_path)
-
-    def sync_legacy_additions(self) -> int:
-        """Bring new source-tree folders/files into the local library without overwriting it."""
-        if not self.legacy_root.is_dir() or self.legacy_root.resolve() == self.root.resolve():
-            return 0
-
-        copied = 0
-        try:
-            source_paths = sorted(self.legacy_root.rglob("*"), key=lambda path: len(path.parts))
-        except OSError:
-            return 0
-        for source in source_paths:
-            relative = source.relative_to(self.legacy_root)
-            if relative.name == "library.json":
-                continue
-            destination = self.root / relative
-            try:
-                if source.is_dir():
-                    destination.mkdir(parents=True, exist_ok=True)
-                elif source.is_file() and not destination.exists():
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, destination)
-                    copied += 1
-            except OSError:
-                continue
-        return copied
+        self.root.mkdir(parents=True, exist_ok=True)
 
     @property
     def entries(self) -> dict[str, dict[str, str]]:
@@ -547,6 +590,75 @@ class SampleLibrary:
         self.data["scan_recursive"] = enabled
         self.save()
 
+    def reference_roots(self) -> list[tuple[Path, bool]]:
+        roots = self.data.get("reference_roots", [])
+        if not isinstance(roots, list):
+            return []
+        result: list[tuple[Path, bool]] = []
+        for record in roots:
+            if not isinstance(record, dict):
+                continue
+            value = record.get("path")
+            if isinstance(value, str) and value:
+                result.append((Path(value), bool(record.get("recursive", False))))
+        return result
+
+    def _infer_reference_roots(self) -> None:
+        """Turn groups of file references into directory roots for live updates."""
+        parent_counts: dict[Path, int] = {}
+        for record in self.entries.values():
+            if not isinstance(record, dict) or record.get("kind") != "reference":
+                continue
+            if record.get("reference_root"):
+                continue
+            path = Path(record.get("path", ""))
+            if path.is_file():
+                parent = path.parent.resolve()
+                parent_counts[parent] = parent_counts.get(parent, 0) + 1
+        for parent, count in parent_counts.items():
+            if count >= 2:
+                self.register_reference_root(parent, recursive=False)
+
+    def register_reference_root(self, path: Path, recursive: bool) -> None:
+        resolved = path.resolve()
+        if not resolved.is_dir() or resolved == self.root.resolve():
+            return
+        roots = self.data.setdefault("reference_roots", [])
+        if not isinstance(roots, list):
+            roots = []
+            self.data["reference_roots"] = roots
+        existing = next(
+            (
+                item
+                for item in roots
+                if isinstance(item, dict) and item.get("path") == str(resolved)
+            ),
+            None,
+        )
+        if isinstance(existing, dict):
+            changed = existing.get("recursive") != bool(recursive)
+            existing["recursive"] = bool(recursive)
+            if "complete" not in existing:
+                existing["complete"] = True
+                changed = True
+            elif changed:
+                existing["complete"] = False
+            if changed:
+                self.save()
+            return
+        roots.append({"path": str(resolved), "recursive": bool(recursive), "complete": False})
+        self.save()
+
+    def mark_reference_root_complete(self, root: Path) -> None:
+        resolved = str(root.resolve())
+        changed = False
+        for record in self.data.get("reference_roots", []):
+            if isinstance(record, dict) and record.get("path") == resolved and not record.get("complete", True):
+                record["complete"] = True
+                changed = True
+        if changed:
+            self.save()
+
     def is_library_path(self, path: Path) -> bool:
         """Return whether a path is inside StemKart's local library root."""
         try:
@@ -558,25 +670,83 @@ class SampleLibrary:
     def protected_directories(self) -> set[Path]:
         return {self.imported_dir.resolve(), self.recorded_dir.resolve(), self.trimmed_dir.resolve()}
 
-    def _record(self, path: Path, kind: str, source: Path | None = None) -> None:
+    def _record(
+        self,
+        path: Path,
+        kind: str,
+        source: Path | None = None,
+        reference_root: Path | None = None,
+    ) -> None:
         resolved = path.resolve()
-        self.entries[str(resolved)] = {
+        record: dict[str, str] = {
             "path": str(resolved),
             "name": resolved.name,
             "kind": kind,
             "source": str(source.resolve()) if source else "",
         }
+        if reference_root is not None:
+            record["reference_root"] = str(reference_root.resolve())
+        self.entries[str(resolved)] = record
 
-    def add_references(self, paths: list[Path]) -> int:
+    def add_references(
+        self,
+        paths: list[Path],
+        reference_root: Path | None = None,
+        recursive: bool = False,
+    ) -> int:
+        if reference_root is not None:
+            self.register_reference_root(reference_root, recursive)
         count = 0
         for path in paths:
             if is_audio_file(path):
                 key = str(path.resolve())
                 if key not in self.entries:
                     count += 1
-                self._record(path, "reference")
+                self._record(path, "reference", reference_root=reference_root)
         self.save()
         return count
+
+    def reconcile_references(
+        self,
+        scans: list[tuple[Path, bool, list[Path]]],
+    ) -> bool:
+        """Merge background scans into metadata without copying source files."""
+        scanned_roots = {str(root.resolve()) for root, _recursive, _paths in scans}
+        found_by_root = {
+            str(root.resolve()): {path.resolve() for path in paths}
+            for root, _recursive, paths in scans
+        }
+        changed = False
+        for root, _recursive, paths in scans:
+            resolved_root = root.resolve()
+            for path in paths:
+                if not is_audio_file(path):
+                    continue
+                key = str(path.resolve())
+                record = self.entries.get(key)
+                if (
+                    not isinstance(record, dict)
+                    or record.get("kind") != "reference"
+                    or record.get("reference_root") != str(resolved_root)
+                ):
+                    self._record(path, "reference", reference_root=resolved_root)
+                    changed = True
+
+        for key, record in list(self.entries.items()):
+            if not isinstance(record, dict) or record.get("kind") != "reference":
+                continue
+            reference_root = record.get("reference_root")
+            path = Path(record.get("path", key))
+            if reference_root in scanned_roots:
+                if path.resolve() not in found_by_root[reference_root]:
+                    self.entries.pop(key, None)
+                    changed = True
+            elif not reference_root and not path.is_file():
+                self.entries.pop(key, None)
+                changed = True
+        if changed:
+            self.save()
+        return changed
 
     def _unique_destination(self, directory: Path, name: str) -> Path:
         candidate = directory / name
@@ -696,23 +866,40 @@ class SampleLibrary:
         folder: Path,
         recursive: bool,
         should_stop: Callable[[], bool] | None = None,
+        on_batch: Callable[[list[Path]], None] | None = None,
+        on_directory: Callable[[Path], None] | None = None,
     ) -> list[Path]:
         if not folder.is_dir():
             return []
         try:
             if not recursive:
-                return sorted(
+                if on_directory:
+                    on_directory(folder)
+                paths = sorted(
                     (path for path in folder.iterdir() if is_audio_file(path)),
                     key=lambda path: path.name.casefold(),
                 )
+                if on_batch and paths:
+                    on_batch(paths)
+                return paths
             audio_paths: list[Path] = []
+            batch: list[Path] = []
             for root, _directories, filenames in os.walk(folder, followlinks=False):
                 if should_stop and should_stop():
                     return []
                 root_path = Path(root)
-                audio_paths.extend(
-                    path for path in (root_path / name for name in filenames) if is_audio_file(path)
-                )
+                if on_directory:
+                    on_directory(root_path)
+                for path in (root_path / name for name in filenames):
+                    if not is_audio_file(path):
+                        continue
+                    audio_paths.append(path)
+                    batch.append(path)
+                    if on_batch and len(batch) >= 128:
+                        on_batch(batch)
+                        batch = []
+            if on_batch and batch:
+                on_batch(batch)
             return sorted(audio_paths, key=lambda path: path.name.casefold())
         except OSError:
             return []
@@ -733,31 +920,223 @@ class SampleLibrary:
             if not isinstance(record, dict) or record.get("kind") != "reference":
                 continue
             path = Path(record.get("path", ""))
-            if path.suffix.lower() in SUPPORTED_SUFFIXES:
+            if is_audio_file(path):
                 paths.append(path)
         return sorted(set(paths), key=lambda path: path.name.casefold())
 
+    def reference_count(self) -> int:
+        """Return the cached reference count without stat-ing every source file."""
+        return sum(
+            1
+            for record in self.entries.values()
+            if isinstance(record, dict) and record.get("kind") == "reference"
+        )
+
+    def cached_files_for_directory(self, folder: Path, recursive: bool) -> list[Path] | None:
+        """Return cached reference locations for a directory, or None if uncached."""
+        resolved_folder = folder.resolve()
+        matching_roots: list[tuple[Path, bool]] = []
+        for root, root_recursive in self.reference_roots():
+            resolved_root = root.resolve()
+            try:
+                resolved_folder.relative_to(resolved_root)
+            except ValueError:
+                continue
+            if not root_recursive and resolved_folder != resolved_root:
+                continue
+            if recursive and not root_recursive:
+                continue
+            matching_roots.append((resolved_root, root_recursive))
+        if not matching_roots:
+            return None
+
+        paths: set[Path] = set()
+        for path in self.reference_files():
+            resolved_path = path.resolve()
+            if recursive:
+                try:
+                    resolved_path.relative_to(resolved_folder)
+                except ValueError:
+                    continue
+                paths.add(resolved_path)
+            elif resolved_path.parent == resolved_folder:
+                paths.add(resolved_path)
+        return sorted(paths, key=lambda path: path.name.casefold())
+
+    def reference_cache_complete_for_directory(self, folder: Path) -> bool:
+        resolved_folder = folder.resolve()
+        matches: list[bool] = []
+        for root, _recursive in self.reference_roots():
+            resolved_root = root.resolve()
+            try:
+                resolved_folder.relative_to(resolved_root)
+            except ValueError:
+                continue
+            record = next(
+                (
+                    item
+                    for item in self.data.get("reference_roots", [])
+                    if isinstance(item, dict) and item.get("path") == str(resolved_root)
+                ),
+                None,
+            )
+            matches.append(not isinstance(record, dict) or record.get("complete", True))
+        return any(matches)
+
+    def reference_root_for_directory(self, folder: Path, recursive: bool) -> Path | None:
+        resolved_folder = folder.resolve()
+        matches: list[Path] = []
+        for root, root_recursive in self.reference_roots():
+            resolved_root = root.resolve()
+            try:
+                resolved_folder.relative_to(resolved_root)
+            except ValueError:
+                continue
+            if not root_recursive and resolved_folder != resolved_root:
+                continue
+            if recursive and not root_recursive and resolved_folder != resolved_root:
+                continue
+            matches.append(resolved_root)
+        return max(matches, key=lambda path: len(path.parts)) if matches else None
+
+    def cache_reference_paths(self, paths: list[Path], reference_root: Path) -> int:
+        changed = 0
+        resolved_root = reference_root.resolve()
+        for path in paths:
+            if not is_audio_file(path):
+                continue
+            key = str(path.resolve())
+            record = self.entries.get(key)
+            if (
+                not isinstance(record, dict)
+                or record.get("kind") != "reference"
+                or record.get("reference_root") != str(resolved_root)
+            ):
+                self._record(path, "reference", reference_root=resolved_root)
+                changed += 1
+        if changed:
+            self._reference_cache_dirty = True
+        return changed
+
+    def reconcile_reference_directory(
+        self,
+        folder: Path,
+        paths: list[Path],
+        reference_root: Path,
+    ) -> bool:
+        resolved_folder = folder.resolve()
+        resolved_root = reference_root.resolve()
+        found = {path.resolve() for path in paths if is_audio_file(path)}
+        changed = bool(self.cache_reference_paths(paths, resolved_root))
+        for key, record in list(self.entries.items()):
+            if not isinstance(record, dict) or record.get("kind") != "reference":
+                continue
+            if record.get("reference_root") != str(resolved_root):
+                continue
+            path = Path(record.get("path", key)).resolve()
+            try:
+                path.relative_to(resolved_folder)
+            except ValueError:
+                continue
+            if path not in found:
+                self.entries.pop(key, None)
+                changed = True
+        if changed:
+            self.mark_reference_root_complete(resolved_root)
+            self.save()
+            self._reference_cache_dirty = False
+        elif self._reference_cache_dirty:
+            # Batch updates may already have populated the dictionary before
+            # the final reconciliation signal arrives.
+            self.save()
+            self._reference_cache_dirty = False
+            self.mark_reference_root_complete(resolved_root)
+        else:
+            self.mark_reference_root_complete(resolved_root)
+        return changed
+
+    def remove_missing_references(self, reference_root: Path) -> bool:
+        """Drop dead reference paths without rescanning the source tree."""
+        resolved_root = str(reference_root.resolve())
+        changed = False
+        for key, record in list(self.entries.items()):
+            if not isinstance(record, dict) or record.get("kind") != "reference":
+                continue
+            if record.get("reference_root") != resolved_root:
+                continue
+            path = Path(record.get("path", key))
+            if not path.is_file():
+                self.entries.pop(key, None)
+                changed = True
+        if changed:
+            self.save()
+        return changed
+
+    def flush_reference_cache(self) -> None:
+        """Persist reference batches without touching the source files."""
+        if self._reference_cache_dirty:
+            self.save()
+            self._reference_cache_dirty = False
+
 
 class FolderScanWorker(QObject):
-    completed = pyqtSignal(object, int)
+    completed = pyqtSignal(object, int, bool)
+    batch = pyqtSignal(object, int, object)
+    directory = pyqtSignal(object, int, object)
 
-    def __init__(self, library: SampleLibrary, folder: Path, recursive: bool, generation: int) -> None:
+    def __init__(
+        self,
+        library: SampleLibrary,
+        folder: Path,
+        recursive: bool,
+        generation: int,
+        reference_root: Path | None = None,
+    ) -> None:
         super().__init__()
         self.library = library
         self.folder = folder
         self.recursive = recursive
         self.generation = generation
+        self.reference_root = reference_root
 
     @pyqtSlot()
     def run(self) -> None:
-        self.completed.emit(
-            self.library.scan_folder(
-                self.folder,
-                self.recursive,
-                should_stop=lambda: QThread.currentThread().isInterruptionRequested(),
+        thread = QThread.currentThread()
+        paths = self.library.scan_folder(
+            self.folder,
+            self.recursive,
+            should_stop=lambda: thread.isInterruptionRequested(),
+            on_batch=lambda paths: self.batch.emit(paths, self.generation, self.reference_root),
+            on_directory=lambda directory: self.directory.emit(
+                directory,
+                self.generation,
+                self.reference_root,
             ),
-            self.generation,
         )
+        self.completed.emit(paths, self.generation, thread.isInterruptionRequested())
+
+
+class ReferenceDirectorySyncWorker(QObject):
+    """Refresh only directories that actually changed on disk."""
+
+    completed = pyqtSignal(object)
+    cancelled = pyqtSignal()
+
+    def __init__(self, library: SampleLibrary, changes: list[tuple[Path, Path]]) -> None:
+        super().__init__()
+        self.library = library
+        self.changes = changes
+
+    @pyqtSlot()
+    def run(self) -> None:
+        results: list[tuple[Path, Path, list[Path]]] = []
+        for folder, reference_root in self.changes:
+            if QThread.currentThread().isInterruptionRequested():
+                self.cancelled.emit()
+                return
+            paths = self.library.scan_folder(folder, recursive=False) if folder.is_dir() else []
+            results.append((folder, reference_root, paths))
+        self.completed.emit(results)
 
 
 class SplitThread(QThread):
@@ -1028,12 +1407,14 @@ class PreviewPlayer(QGroupBox):
         self.file_path: Path | None = None
         self.clip_start = 0
         self.clip_end: int | None = None
+        self._play_when_ready = False
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
         self.player.positionChanged.connect(self._position_changed)
         self.player.durationChanged.connect(self._duration_changed)
+        self.player.mediaStatusChanged.connect(self._media_status_changed)
         self.player.playbackStateChanged.connect(self._playback_state_changed)
         self.player.errorOccurred.connect(self._playback_error)
 
@@ -1117,6 +1498,7 @@ class PreviewPlayer(QGroupBox):
         self.position_slider.setEnabled(enabled)
 
     def set_file(self, path: Path | None) -> None:
+        self._play_when_ready = False
         self.player.stop()
         self.file_path = path if path and path.exists() else None
         self.clip_start = 0
@@ -1125,13 +1507,13 @@ class PreviewPlayer(QGroupBox):
         self.position_label.setText("0:00")
         self.duration_label.setText("0:00")
         if self.file_path:
-            self.file_label.setText(self.file_path.name)
+            self.file_label.setText(f"Loading {self.file_path.name}...")
             self.player.setSource(QUrl.fromLocalFile(str(self.file_path)))
         else:
             self.file_label.setText("Select an audio file")
             self.player.setSource(QUrl())
         self.playhead_changed.emit(0, 0)
-        self._set_controls_enabled(self.file_path is not None)
+        self._set_controls_enabled(False)
 
     def set_clip(self, start_ms: int, end_ms: int | None) -> None:
         self.clip_start = max(0, start_ms)
@@ -1140,8 +1522,24 @@ class PreviewPlayer(QGroupBox):
     def _play(self) -> None:
         if not self.file_path:
             return
-        if self.player.position() >= (self.clip_end or self.player.duration()):
+        if self.player.mediaStatus() not in (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+            QMediaPlayer.MediaStatus.BufferingMedia,
+            QMediaPlayer.MediaStatus.EndOfMedia,
+        ):
+            self._play_when_ready = True
+            return
+        end_position = self.clip_end or self.player.duration()
+        at_end = (
+            self.player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia
+            or (end_position > 0 and self.player.position() >= end_position)
+        )
+        if at_end:
+            self.player.stop()
             self.player.setPosition(self.clip_start)
+            QTimer.singleShot(0, self.player.play)
+            return
         self.player.play()
 
     def _pause(self) -> None:
@@ -1149,8 +1547,7 @@ class PreviewPlayer(QGroupBox):
 
     def play_selection(self, start_ms: int, end_ms: int | None) -> None:
         self.set_clip(start_ms, end_ms)
-        self.player.setPosition(self.clip_start)
-        self.player.play()
+        self._play()
 
     def _stop(self) -> None:
         self.player.stop()
@@ -1188,10 +1585,28 @@ class PreviewPlayer(QGroupBox):
         self.position_slider.setRange(0, max(0, duration))
         self.duration_label.setText(format_time(duration))
 
+    def _media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
+        if not self.file_path:
+            return
+        if status in (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        ):
+            self.file_label.setText(self.file_path.name)
+            self._set_controls_enabled(True)
+            if self._play_when_ready:
+                self._play_when_ready = False
+                self._play()
+        elif status == QMediaPlayer.MediaStatus.InvalidMedia:
+            self._play_when_ready = False
+            self._set_controls_enabled(False)
+
     def _playback_state_changed(self, _state: QMediaPlayer.PlaybackState) -> None:
         pass
 
     def _playback_error(self, _error: QMediaPlayer.Error) -> None:
+        self._play_when_ready = False
+        self._set_controls_enabled(False)
         if self.player.errorString():
             self.file_label.setText(f"Playback error: {self.player.errorString()}")
 
@@ -1206,6 +1621,19 @@ class WaveformDecodeThread(QThread):
     def __init__(self, path: Path) -> None:
         super().__init__()
         self.path = path
+        self._process: subprocess.Popen | None = None
+
+    def cancel(self) -> None:
+        self.requestInterruption()
+        process = self._process
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
     def run(self) -> None:
         command = [
@@ -1223,15 +1651,29 @@ class WaveformDecodeThread(QThread):
             "-",
         ]
         try:
-            result = subprocess.run(command, capture_output=True, check=False)
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self._process = process
+            while True:
+                if self.isInterruptionRequested():
+                    self.cancel()
+                    return
+                try:
+                    stdout, stderr = process.communicate(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         except OSError as exc:
             self.failed.emit(f"Could not run FFmpeg: {exc}")
             return
-        if result.returncode != 0:
-            details = result.stderr.decode("utf-8", errors="replace").strip()
+        finally:
+            self._process = None
+        if self.isInterruptionRequested():
+            return
+        if process.returncode != 0:
+            details = stderr.decode("utf-8", errors="replace").strip()
             self.failed.emit(details or "FFmpeg could not decode this file.")
             return
-        samples = np.frombuffer(result.stdout, dtype=np.float32).copy()
+        samples = np.frombuffer(stdout, dtype=np.float32).copy()
         if not samples.size:
             self.failed.emit("This file contains no decodable audio.")
             return
@@ -1481,10 +1923,11 @@ class WaveformEditor(QGroupBox):
         controls = QHBoxLayout()
         controls.setSpacing(3)
         controls.setContentsMargins(0, 0, 0, 0)
-        self.range_label = QLabel("Full file")
-        self.range_label.setFixedWidth(106)
-        self.range_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        controls.addWidget(self.range_label)
+        self.playback_time_label = QLabel("0:00 - 0:00")
+        self.playback_time_label.setFixedWidth(106)
+        self.playback_time_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.playback_time_label.setToolTip("Current playback position and total duration")
+        controls.addWidget(self.playback_time_label)
         self.set_start_button = ThemedTextButton("Set Start")
         self.set_start_button.setToolTip("Set the start marker to the current playhead position")
         self.set_start_button.clicked.connect(self._set_start_from_playhead)
@@ -1493,11 +1936,11 @@ class WaveformEditor(QGroupBox):
         self.set_end_button.setToolTip("Set the end marker to the current playhead position")
         self.set_end_button.clicked.connect(self._set_end_from_playhead)
         controls.addWidget(self.set_end_button)
-        self.playback_time_label = QLabel("0:00 - 0:00")
-        self.playback_time_label.setFixedWidth(106)
-        self.playback_time_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.playback_time_label.setToolTip("Current playback position and total duration")
-        controls.addWidget(self.playback_time_label)
+        self.range_label = QLabel("Full file")
+        self.range_label.setFixedWidth(106)
+        self.range_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.range_label.setToolTip("Trim start and end")
+        controls.addWidget(self.range_label)
         controls.addStretch()
         self.play_button = self._icon_button("Play", QStyle.StandardPixmap.SP_MediaPlay)
         self.play_button.setIcon(self._editor_icon("play"))
@@ -1629,6 +2072,7 @@ class WaveformEditor(QGroupBox):
     def _confirm_split_sample(self) -> None:
         if not self.samples.size:
             return
+        start, end = self.waveform.range_samples()
         if ask_confirmation(
             self,
             "Split sample",
@@ -1636,6 +2080,12 @@ class WaveformEditor(QGroupBox):
             accept_label="Split sample",
             reject_label="Cancel",
         ):
+            # Splitting the current selection is also a trim edit from the
+            # editor's point of view. Keep the full source available so Undo
+            # still works after the split has been launched.
+            if (start != 0 or end != len(self.samples)) and self.undo_state is None:
+                self.undo_state = (self.samples.copy(), self.sample_rate, self.working_name)
+                self._set_action_state(True)
             self.split_requested.emit(self._write_split_source())
 
     def _waveform_playhead_requested(self, position_ms: int) -> None:
@@ -1649,8 +2099,8 @@ class WaveformEditor(QGroupBox):
         self.load_serial += 1
         load_serial = self.load_serial
         if self.decode_thread and self.decode_thread.isRunning():
-            self.decode_thread.terminate()
-            self.decode_thread.wait(1000)
+            self.decode_thread.cancel()
+            self.decode_thread.wait(1500)
         self.file_path = path if path and path.exists() else None
         self.samples = np.array([], dtype=np.float32)
         self.working_name = self.file_path.name if self.file_path else ""
@@ -1783,8 +2233,8 @@ class WaveformEditor(QGroupBox):
 
     def close_editor(self) -> None:
         if self.decode_thread and self.decode_thread.isRunning():
-            self.decode_thread.terminate()
-            self.decode_thread.wait(1000)
+            self.decode_thread.cancel()
+            self.decode_thread.wait(1500)
         shutil.rmtree(self.preview_dir, ignore_errors=True)
 
 
@@ -2312,7 +2762,7 @@ class DarkTitleBar(QWidget):
         super().__init__(window)
         self.window = window
         self.dialog = dialog
-        self.setObjectName("titleBar")
+        self.setObjectName("dialogTitleBar" if dialog else "titleBar")
         self.setFixedHeight(36)
 
         layout = QGridLayout(self)
@@ -2323,12 +2773,12 @@ class DarkTitleBar(QWidget):
         layout.setColumnStretch(1, 1)
 
         title = QLabel(window.windowTitle() or APP_NAME)
-        title.setObjectName("titleBarTitle")
+        title.setObjectName("dialogTitleBarTitle" if dialog else "titleBarTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title, 0, 1)
 
         buttons = QWidget()
-        buttons.setObjectName("titleBarButtons")
+        buttons.setObjectName("dialogTitleBarButtons" if dialog else "titleBarButtons")
         buttons_layout = QHBoxLayout(buttons)
         buttons_layout.setContentsMargins(0, 0, 0, 0)
         buttons_layout.setSpacing(2)
@@ -2365,88 +2815,14 @@ class DarkTitleBar(QWidget):
         super().mouseDoubleClickEvent(event)
 
 
-class StemKartMessageDialog(QDialog):
-    """A deliberately simple message dialog with no platform-owned artwork."""
-
-    def __init__(
-        self,
-        parent: QWidget | None,
-        title: str,
-        message: str,
-        buttons: tuple[str, ...],
-        accept_label: str | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setModal(True)
-        self.setMinimumWidth(420)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        application = QApplication.instance()
-        surface_color = (
-            application.palette().window().color().name()
-            if application is not None
-            else "#000000"
-        )
-        surface = QFrame()
-        surface.setObjectName("dialogSurface")
-        surface.setStyleSheet(
-            f"QFrame#dialogSurface {{ background: {surface_color}; border: none; }}"
-        )
-        surface_layout = QVBoxLayout(surface)
-        surface_layout.setContentsMargins(0, 0, 8, 8)
-        surface_layout.setSpacing(0)
-
-        frame = QFrame()
-        frame.setObjectName("retroWindowFrame")
-        frame.setStyleSheet(
-            "QFrame#retroWindowFrame { border: 2px solid #ff7a00; }"
-        )
-        shadow = QGraphicsDropShadowEffect(frame)
-        shadow.setBlurRadius(0)
-        shadow.setOffset(4, 4)
-        shadow.setColor(QColor("#8a3d00"))
-        frame.setGraphicsEffect(shadow)
-        frame_layout = QVBoxLayout(frame)
-        frame_layout.setContentsMargins(0, 0, 0, 0)
-        frame_layout.setSpacing(0)
-        frame_layout.addWidget(DarkTitleBar(self, dialog=True))
-        surface_layout.addWidget(frame)
-        layout.addWidget(surface)
-
-        body = QWidget()
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(24, 16, 24, 14)
-        body_layout.setSpacing(16)
-        message_label = QLabel(message)
-        message_label.setWordWrap(True)
-        message_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        body_layout.addWidget(message_label)
-
-        button_row = QHBoxLayout()
-        button_row.addStretch()
-        self._buttons: dict[str, QPushButton] = {}
-        for label in buttons:
-            button = QPushButton(label)
-            button.setMinimumWidth(76)
-            button.clicked.connect(self.accept if label == accept_label else self.reject)
-            button_row.addWidget(button)
-            self._buttons[label] = button
-        body_layout.addLayout(button_row)
-        frame_layout.addWidget(body)
-        self.adjustSize()
-        self.resize(max(self.width(), 420), self.height())
-        if accept_label and accept_label in self._buttons:
-            self._buttons[accept_label].setDefault(True)
-
-
 def show_message(parent: QWidget, title: str, message: str) -> None:
-    StemKartMessageDialog(parent, title, message, ("OK",), accept_label="OK").exec()
+    dialog = QMessageBox(parent)
+    dialog.setWindowTitle(title)
+    dialog.setText(message)
+    dialog.setIcon(QMessageBox.Icon.NoIcon)
+    ok_button = dialog.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+    dialog.setDefaultButton(ok_button)
+    dialog.exec()
 
 
 def ask_confirmation(
@@ -2456,14 +2832,15 @@ def ask_confirmation(
     accept_label: str = "Yes",
     reject_label: str = "No",
 ) -> bool:
-    dialog = StemKartMessageDialog(
-        parent,
-        title,
-        message,
-        (reject_label, accept_label),
-        accept_label=accept_label,
-    )
-    return dialog.exec() == QDialog.DialogCode.Accepted
+    dialog = QMessageBox(parent)
+    dialog.setWindowTitle(title)
+    dialog.setText(message)
+    dialog.setIcon(QMessageBox.Icon.NoIcon)
+    dialog.addButton(reject_label, QMessageBox.ButtonRole.RejectRole)
+    accept_button = dialog.addButton(accept_label, QMessageBox.ButtonRole.AcceptRole)
+    dialog.setDefaultButton(accept_button)
+    dialog.exec()
+    return dialog.clickedButton() is accept_button
 
 
 def normalize_message_box(dialog: QMessageBox) -> None:
@@ -2473,6 +2850,37 @@ def normalize_message_box(dialog: QMessageBox) -> None:
         label.setWordWrap(True)
     for button in dialog.buttons():
         button.setIcon(QIcon())
+
+
+def finalize_dialog_content_layout(dialog: QDialog) -> None:
+    """Keep standard dialog content below the client-side title bar."""
+    layout = dialog.layout()
+    if layout is None:
+        return
+    target_top = dialog.property("stemkart_dialog_content_top")
+    if not isinstance(target_top, int):
+        margins = layout.contentsMargins()
+        target_top = margins.top() + 36
+        dialog.setProperty("stemkart_dialog_content_top", target_top)
+    margins = layout.contentsMargins()
+    if margins.top() != target_top:
+        layout.setContentsMargins(
+            margins.left(),
+            target_top,
+            margins.right(),
+            margins.bottom(),
+        )
+    layout.activate()
+    size_hint = dialog.sizeHint()
+    minimum_width = 360 if isinstance(dialog, QInputDialog) else 300
+    dialog.resize(
+        max(dialog.width(), minimum_width, size_hint.width()),
+        max(dialog.height(), size_hint.height()),
+    )
+    title_bar = getattr(dialog, "_stemkart_title_bar", None)
+    if title_bar is not None:
+        title_bar.setGeometry(0, 0, dialog.width(), 36)
+        title_bar.raise_()
 
 
 def style_dialog(dialog: QDialog) -> None:
@@ -2490,14 +2898,6 @@ def style_dialog(dialog: QDialog) -> None:
         minimum_width = 360
     dialog.setMinimumWidth(max(minimum_width, dialog.minimumWidth()))
     layout = dialog.layout()
-    if layout is not None:
-        margins = layout.contentsMargins()
-        layout.setContentsMargins(
-            margins.left(),
-            margins.top() + 36,
-            margins.right(),
-            margins.bottom(),
-        )
     title_bar = DarkTitleBar(dialog, dialog=True)
     dialog._stemkart_title_bar = title_bar
     if isinstance(dialog, QFileDialog):
@@ -2511,6 +2911,20 @@ def style_dialog(dialog: QDialog) -> None:
                 button.setIcon(tinted_icon(button.icon(), foreground))
     dialog.adjustSize()
     dialog.resize(max(dialog.width(), minimum_width), dialog.height())
+    if layout is not None and not isinstance(dialog, (QInputDialog, QFileDialog)):
+        margins = layout.contentsMargins()
+        layout.setContentsMargins(
+            margins.left(),
+            margins.top() + 36,
+            margins.right(),
+            margins.bottom(),
+        )
+        layout.activate()
+        size_hint = dialog.sizeHint()
+        dialog.resize(
+            max(dialog.width(), minimum_width, size_hint.width()),
+            max(dialog.height(), size_hint.height()),
+        )
     title_bar.setGeometry(0, 0, dialog.width(), 36)
     title_bar.raise_()
 
@@ -2551,8 +2965,11 @@ class DialogThemeFilter(QObject):
             # nested platform loop.
             if event.type() in (QEvent.Type.Polish, QEvent.Type.WindowTitleChange):
                 style_dialog(watched)
-            elif event.type() == QEvent.Type.Show and isinstance(watched, QMessageBox):
-                normalize_message_box(watched)
+            elif event.type() == QEvent.Type.Show:
+                if isinstance(watched, QMessageBox):
+                    normalize_message_box(watched)
+                elif isinstance(watched, (QInputDialog, QFileDialog)):
+                    finalize_dialog_content_layout(watched)
             elif event.type() == QEvent.Type.Resize:
                 minimum_width = 420 if isinstance(watched, QMessageBox) else 360 if isinstance(watched, QInputDialog) else 0
                 if minimum_width and watched.width() < minimum_width:
@@ -2562,6 +2979,8 @@ class DialogThemeFilter(QObject):
                 if title_bar is not None:
                     title_bar.setGeometry(0, 0, watched.width(), 36)
                     title_bar.raise_()
+                if isinstance(watched, (QInputDialog, QFileDialog)):
+                    finalize_dialog_content_layout(watched)
         return super().eventFilter(watched, event)
 
 
@@ -2580,6 +2999,21 @@ class AudioSplitter(QMainWindow):
         self._folder_scan_generation = 0
         self._folder_scan_threads: list[QThread] = []
         self._folder_scan_workers: list[FolderScanWorker] = []
+        self._folder_scan_reference_context: dict[int, tuple[Path, Path | None] | None] = {}
+        self._folder_scan_paths: dict[QThread, Path] = {}
+        self._reference_sync_thread: QThread | None = None
+        self._reference_sync_worker: ReferenceDirectorySyncWorker | None = None
+        self._reference_change_queue: dict[str, tuple[Path, Path]] = {}
+        self._reference_sync_pending = False
+        self._reference_scan_cached_since_save = 0
+        self._library_tree_built = False
+        self._library_tree_dirty = True
+        self._explorer_list_directory: Path | None = None
+        self._library_list_directory: Path | None = None
+        self._library_list_is_references = False
+        self._library_list_dirty = False
+        self._explorer_status_text = ""
+        self._library_status_text = ""
 
         self.setWindowTitle(APP_NAME)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
@@ -2589,6 +3023,18 @@ class AudioSplitter(QMainWindow):
 
         self._build_ui()
         self.statusBar().setVisible(False)
+        self._reference_watcher = QFileSystemWatcher(self)
+        self._reference_watcher.directoryChanged.connect(self._reference_directory_changed)
+        self._reference_change_timer = QTimer(self)
+        self._reference_change_timer.setSingleShot(True)
+        self._reference_change_timer.setInterval(250)
+        self._reference_change_timer.timeout.connect(self._start_reference_change_sync)
+        self._reference_view_refresh_timer = QTimer(self)
+        self._reference_view_refresh_timer.setSingleShot(True)
+        self._reference_view_refresh_timer.setInterval(250)
+        self._reference_view_refresh_timer.timeout.connect(self._refresh_reference_contents)
+        for root, recursive in self.sample_library.reference_roots():
+            self._watch_reference_root(root, recursive)
         self._size_grip = StemKartSizeGrip(self)
         self._size_grip.setFixedSize(16, 16)
         self._size_grip.move(self.width() - self._size_grip.width(), self.height() - self._size_grip.height())
@@ -2606,31 +3052,17 @@ class AudioSplitter(QMainWindow):
         application = QApplication.instance()
         if application is None:
             return
-        sample_list = self.sample_file_list
-        sample_list_parent = sample_list.parentWidget()
-        sample_list_layout = sample_list_parent.layout() if sample_list_parent else None
-        sample_list_index = sample_list_layout.indexOf(sample_list) if sample_list_layout else -1
-        sample_list_was_visible = sample_list.isVisible()
-        if sample_list_layout is not None and sample_list_index >= 0:
-            sample_list_layout.removeWidget(sample_list)
-            sample_list.setParent(None)
-        try:
-            apply_style(application, light_mode=self.light_mode)
-            foreground = application.palette().text().color().name()
-            for button in self.findChildren(QPushButton):
-                if isinstance(button, ThemedIconButton):
-                    button._update_icon_color()
-                elif not button.icon().isNull():
-                    button.setIcon(tinted_icon(button.icon(), foreground, size=24))
-            self.folder_icon_provider = MonochromeIconProvider("#ff7a00")
-            self.folder_model.setIconProvider(self.folder_icon_provider)
-            self.folder_tree.viewport().update()
-            self._style_tabs()
-        finally:
-            if sample_list_layout is not None and sample_list_index >= 0:
-                sample_list_layout.insertWidget(sample_list_index, sample_list, 1)
-                if sample_list_was_visible:
-                    sample_list.show()
+        apply_style(application, light_mode=self.light_mode)
+        foreground = application.palette().text().color().name()
+        for button in self.findChildren(QPushButton):
+            if isinstance(button, ThemedIconButton):
+                button._update_icon_color()
+            elif not button.icon().isNull():
+                button.setIcon(tinted_icon(button.icon(), foreground, size=24))
+        self.folder_icon_provider = MonochromeIconProvider("#ff7a00")
+        self.folder_model.setIconProvider(self.folder_icon_provider)
+        self.folder_tree.viewport().update()
+        self._style_tabs()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -2680,11 +3112,13 @@ class AudioSplitter(QMainWindow):
         source_text.addWidget(self.file_label)
         source_layout.addLayout(source_text, 1)
         self.choose_button = QPushButton("Choose track...")
+        self.choose_button.setObjectName("chooseButton")
         self.choose_button.clicked.connect(self.choose_track)
         source_layout.addWidget(self.choose_button)
         splitter_layout.addWidget(source)
 
         self.split_button = QPushButton("Split track")
+        self.split_button.setObjectName("splitButton")
         self.split_button.setMinimumHeight(36)
         self.split_button.setEnabled(False)
         self.split_button.clicked.connect(self.split_track)
@@ -2695,7 +3129,7 @@ class AudioSplitter(QMainWindow):
         progress_layout.setContentsMargins(0, 0, 0, 0)
         progress_layout.setSpacing(10)
         self.progress_label = QLabel()
-        self.progress_bar = QProgressBar()
+        self.progress_bar = BarberPoleProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
@@ -2844,6 +3278,7 @@ class AudioSplitter(QMainWindow):
         self.library_tree.setHeaderHidden(True)
         self.library_tree.setFrameShape(QFrame.Shape.NoFrame)
         self.library_tree.itemClicked.connect(self._library_tree_changed)
+        self.library_tree.itemExpanded.connect(self._library_tree_expanded)
         self.library_tree.setVisible(False)
         folders_layout.addWidget(self.library_tree)
         browser.addWidget(folders)
@@ -2855,14 +3290,15 @@ class AudioSplitter(QMainWindow):
         self.samples_location_label = QLabel("Select a folder")
         self.samples_location_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         files_layout.addWidget(self.samples_location_label)
-        self.sample_file_list = QListWidget()
-        self.sample_file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.sample_file_list.setFrameShape(QFrame.Shape.NoFrame)
-        self.sample_file_list.currentItemChanged.connect(self._sample_selection_changed)
-        self.sample_file_list.itemDoubleClicked.connect(lambda _item: self.preview_player._play())
-        files_layout.addWidget(self.sample_file_list, 1)
+        self.sample_file_lists = QStackedWidget()
+        self.explorer_file_list = self._create_sample_file_list()
+        self.library_file_list = self._create_sample_file_list()
+        self.sample_file_lists.addWidget(self.explorer_file_list)
+        self.sample_file_lists.addWidget(self.library_file_list)
+        self.sample_file_list = self.explorer_file_list
+        files_layout.addWidget(self.sample_file_lists, 1)
 
-        self.scan_recursive_checkbox = QCheckBox("Scan subfolders")
+        self.scan_recursive_checkbox = OrangeCheckBox("Scan subfolders")
         self.scan_recursive_checkbox.setChecked(self.sample_library.scan_recursive)
         self.scan_recursive_checkbox.toggled.connect(self._scan_recursive_changed)
 
@@ -2959,10 +3395,37 @@ class AudioSplitter(QMainWindow):
 
         last_directory = self.sample_library.last_directory
         self._restore_samples_directory(last_directory)
+        self._preload_library_view()
         return page
+
+    def _create_sample_file_list(self) -> QListWidget:
+        sample_list = QListWidget()
+        sample_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        sample_list.setFrameShape(QFrame.Shape.NoFrame)
+        sample_list.currentItemChanged.connect(self._sample_selection_changed)
+        sample_list.itemDoubleClicked.connect(lambda _item: self.preview_player._play())
+        return sample_list
+
+    def _activate_sample_list(self, showing_library: bool) -> None:
+        sample_list = self.library_file_list if showing_library else self.explorer_file_list
+        self.sample_file_lists.setCurrentWidget(sample_list)
+        self.sample_file_list = sample_list
+
+    def _preload_library_view(self) -> None:
+        """Build the hidden Library pane once so switching tabs is only a view change."""
+        library_root = self.sample_library.root
+        library_paths = self.sample_library.scan_folder(library_root, recursive=False)
+        self._populate_sample_file_list(self.library_file_list, library_paths)
+        self._library_list_directory = library_root.resolve()
+        self._library_list_is_references = False
+        self._library_list_dirty = False
+        self._library_status_text = f"{len(library_paths)} audio files"
+        self._populate_library_tree()
 
     def _set_sample_view(self, view: str) -> None:
         showing_explorer = view == "explorer"
+        if not showing_explorer:
+            self._cancel_folder_scans()
         self.explorer_view_button.setChecked(showing_explorer)
         self.library_view_button.setChecked(not showing_explorer)
         self.scan_recursive_checkbox.setVisible(showing_explorer)
@@ -2975,25 +3438,61 @@ class AudioSplitter(QMainWindow):
         self.copy_folder_button.setVisible(showing_explorer)
         if showing_explorer:
             self.showing_library = False
+            self._activate_sample_list(False)
             self.samples_location_label.setVisible(True)
             self.folder_tree.setVisible(True)
             self.library_tree.setVisible(False)
-            root_index = self.folder_model.setRootPath(self.filesystem_root)
-            self.folder_tree.setRootIndex(root_index)
-            self._restore_samples_directory(self.last_explorer_directory)
-            self._show_current_folder()
+            target = self.last_explorer_directory
+            if self._explorer_list_directory != target.resolve():
+                self._restore_samples_directory(target)
+            else:
+                self.current_samples_directory = target
+                self.samples_location_label.setText(str(target))
+                self.samples_status.setText(self._explorer_status_text)
         else:
             self.showing_library = True
+            self._activate_sample_list(True)
             self.folder_tree.setVisible(False)
             self.library_tree.setVisible(True)
             self._populate_library_tree()
-            self._show_directory(self.sample_library.root)
+            selected_item = self.library_tree.currentItem()
+            selected_value = (
+                selected_item.data(0, Qt.ItemDataRole.UserRole)
+                if selected_item is not None
+                else None
+            )
+            if selected_value == "references":
+                if not self._library_list_is_references or self._library_list_dirty:
+                    self._show_references()
+                else:
+                    self.current_samples_directory = None
+                    self.samples_location_label.clear()
+                    self.samples_location_label.setVisible(False)
+                    self.samples_status.setText(self._library_status_text)
+            else:
+                target = Path(selected_value) if selected_value else self.sample_library.root
+                if not target.is_dir() or not self.sample_library.is_library_path(target):
+                    target = self.sample_library.root
+                if (
+                    self._library_list_is_references
+                    or self._library_list_directory != target.resolve()
+                ):
+                    self._show_directory(target)
+                else:
+                    self.current_samples_directory = target
+                    self.samples_location_label.setText(str(target))
+                    self.samples_location_label.setVisible(True)
+                    self.samples_status.setText(self._library_status_text)
 
     def _restore_samples_directory(self, path: Path) -> None:
         index = self.folder_model.index(str(path))
         if index.isValid():
+            selection_model = self.folder_tree.selectionModel()
+            blocker = QSignalBlocker(selection_model)
             self.folder_tree.setCurrentIndex(index)
+            del blocker
             self.folder_tree.scrollTo(index)
+            self._show_directory(path)
         else:
             self._show_directory(Path.home())
 
@@ -3007,20 +3506,171 @@ class AudioSplitter(QMainWindow):
         if not self.showing_library and self.current_samples_directory:
             self._show_directory(self.current_samples_directory)
 
+    def _cancel_folder_scans(self, except_path: Path | None = None) -> None:
+        resolved_except = except_path.resolve() if except_path is not None else None
+        for thread, path in list(self._folder_scan_paths.items()):
+            if resolved_except is not None and path.resolve() == resolved_except:
+                continue
+            reference_root = self.sample_library.reference_root_for_directory(path, recursive=True)
+            if reference_root is not None and reference_root.resolve() == path.resolve():
+                continue
+            thread.requestInterruption()
+
     def _forget_folder_scan_thread(self, thread: QThread, worker: FolderScanWorker) -> None:
         if thread in self._folder_scan_threads:
             self._folder_scan_threads.remove(thread)
         if worker in self._folder_scan_workers:
             self._folder_scan_workers.remove(worker)
+        self._folder_scan_paths.pop(thread, None)
 
-    def _start_folder_scan(self, path: Path, generation: int) -> None:
-        for thread in self._folder_scan_threads:
-            thread.requestInterruption()
-        self._replace_sample_file_list([], "Scanning folder...")
+    def _watch_reference_root(self, root: Path, recursive: bool) -> None:
+        """Watch a registered root without exhausting inotify watches."""
+        resolved_root = root.resolve()
+        existing = set(self._reference_watcher.directories())
+        if resolved_root.is_dir() and str(resolved_root) not in existing:
+            self._reference_watcher.addPath(str(resolved_root))
+
+    def _watch_reference_children(self, directory: Path, recursive: bool) -> None:
+        """Add watchers for newly created child directories only."""
+        if not directory.is_dir():
+            return
+        existing = set(self._reference_watcher.directories())
+        try:
+            children = [child for child in directory.iterdir() if child.is_dir()]
+        except OSError:
+            return
+        for child in children:
+            if str(child) in existing:
+                continue
+            self._reference_watcher.addPath(str(child))
+            existing.add(str(child))
+            if recursive:
+                self._watch_reference_root(child, recursive=True)
+
+    def _reference_directory_changed(self, path: str) -> None:
+        changed_directory = Path(path).resolve()
+        for root, recursive in self.sample_library.reference_roots():
+            resolved_root = root.resolve()
+            try:
+                changed_directory.relative_to(resolved_root)
+            except ValueError:
+                continue
+            if changed_directory != resolved_root and not recursive:
+                continue
+            self._reference_change_queue[str(changed_directory)] = (changed_directory, resolved_root)
+            if recursive:
+                self._watch_reference_children(changed_directory, recursive=True)
+            if any(thread.isRunning() for thread in self._folder_scan_threads):
+                self._reference_sync_pending = True
+            else:
+                self._reference_change_timer.start()
+            break
+
+    def _start_reference_change_sync(self) -> None:
+        if not self._reference_change_queue:
+            return
+        if any(thread.isRunning() for thread in self._folder_scan_threads):
+            self._reference_sync_pending = True
+            return
+        if self._reference_sync_thread and self._reference_sync_thread.isRunning():
+            self._reference_sync_pending = True
+            return
+        changes = list(self._reference_change_queue.values())
+        self._reference_change_queue.clear()
         thread = QThread(self)
-        worker = FolderScanWorker(self.sample_library, path, recursive=True, generation=generation)
+        worker = ReferenceDirectorySyncWorker(self.sample_library, changes)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        worker.completed.connect(self._reference_directory_sync_finished)
+        worker.completed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._reference_sync_finished)
+        self._reference_sync_thread = thread
+        self._reference_sync_worker = worker
+        thread.start()
+
+    @pyqtSlot(object)
+    def _reference_directory_sync_finished(
+        self,
+        results: list[tuple[Path, Path, list[Path]]],
+    ) -> None:
+        changed = False
+        for folder, reference_root, paths in results:
+            changed = self.sample_library.reconcile_reference_directory(
+                folder,
+                paths,
+                reference_root,
+            ) or changed
+            changed = self.sample_library.remove_missing_references(reference_root) or changed
+        if not changed:
+            return
+        self._library_tree_dirty = True
+        self._library_list_dirty = True
+        if self.showing_library:
+            self._refresh_reference_library_view()
+        elif self.current_samples_directory is not None:
+            recursive = self.scan_recursive_checkbox.isChecked()
+            cached = self.sample_library.cached_files_for_directory(
+                self.current_samples_directory,
+                recursive,
+            )
+            if cached is not None:
+                self._replace_sample_file_list(cached, f"{len(cached)} audio files")
+
+    @pyqtSlot(object, int, object)
+    def _reference_scan_directory(
+        self,
+        directory: Path,
+        generation: int,
+        reference_root: Path,
+    ) -> None:
+        if generation != self._folder_scan_generation:
+            return
+        resolved_directory = directory.resolve()
+        resolved_root = reference_root.resolve()
+        if resolved_directory == resolved_root:
+            self._watch_reference_root(resolved_root, recursive=False)
+
+    def _start_folder_scan(
+        self,
+        path: Path,
+        generation: int,
+        preserve_existing: bool = False,
+    ) -> None:
+        self._cancel_folder_scans(except_path=path)
+        reference_root = self.sample_library.reference_root_for_directory(path, recursive=True)
+        if reference_root is None:
+            # A recursive Explorer scan is also the reference-location cache
+            # for the selected folder. Keep paths in metadata rather than
+            # copying audio, so the Library view can reuse this scan.
+            reference_root = path.resolve()
+            self.sample_library.register_reference_root(reference_root, recursive=True)
+            if hasattr(self, "_reference_watcher"):
+                self._watch_reference_root(reference_root, recursive=True)
+        elif reference_root.resolve() == path.resolve():
+            self.sample_library.register_reference_root(reference_root, recursive=True)
+        self._folder_scan_reference_context[generation] = (path, reference_root)
+        status = "Scanning folder..."
+        if reference_root:
+            status = "Scanning folder...  Updating references in background..."
+        if preserve_existing:
+            self.samples_status.setText(status)
+        else:
+            self._replace_sample_file_list([], status)
+        thread = QThread(self)
+        worker = FolderScanWorker(
+            self.sample_library,
+            path,
+            recursive=True,
+            generation=generation,
+            reference_root=reference_root,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        if reference_root:
+            worker.batch.connect(self._reference_scan_batch, Qt.ConnectionType.QueuedConnection)
+            worker.directory.connect(self._reference_scan_directory, Qt.ConnectionType.QueuedConnection)
         worker.completed.connect(self._folder_scan_finished)
         worker.completed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
@@ -3029,17 +3679,80 @@ class AudioSplitter(QMainWindow):
         )
         self._folder_scan_threads.append(thread)
         self._folder_scan_workers.append(worker)
+        self._folder_scan_paths[thread] = path
         thread.start()
 
-    @pyqtSlot(object, int)
-    def _folder_scan_finished(self, paths: list[Path], generation: int) -> None:
+    @pyqtSlot(object, int, object)
+    def _reference_scan_batch(
+        self,
+        paths: list[Path],
+        generation: int,
+        reference_root: Path,
+    ) -> None:
+        added = self.sample_library.cache_reference_paths(paths, reference_root)
+        if added:
+            self._library_tree_dirty = True
+            self._library_list_dirty = True
+            self._reference_scan_cached_since_save += added
+            if self._reference_scan_cached_since_save >= 128:
+                self.sample_library.flush_reference_cache()
+                self._reference_scan_cached_since_save = 0
+            if generation == self._folder_scan_generation:
+                self.samples_status.setText(
+                    f"Scanning folder...  Updating references ({self.sample_library.reference_count()})..."
+                )
+                if self.showing_library:
+                    self._reference_view_refresh_timer.start()
+
+    @pyqtSlot(object, int, bool)
+    def _folder_scan_finished(self, paths: list[Path], generation: int, cancelled: bool) -> None:
+        reference_context = self._folder_scan_reference_context.pop(generation, None)
+        folder = reference_context[0] if reference_context else None
+        reference_root = reference_context[1] if reference_context else None
+        if folder is not None and reference_root is None:
+            reference_root = self.sample_library.reference_root_for_directory(folder, recursive=True)
+        if folder is not None and reference_root is not None and not cancelled:
+            changed = self.sample_library.reconcile_reference_directory(
+                folder,
+                paths,
+                reference_root,
+            )
+            if changed:
+                self._library_list_dirty = True
+        elif cancelled:
+            self.sample_library.flush_reference_cache()
+        self._reference_scan_cached_since_save = 0
+        if self._reference_sync_pending:
+            self._reference_sync_pending = False
+            self._reference_change_timer.start()
         if generation != self._folder_scan_generation:
             return
-        if self.showing_library or self.current_samples_directory is None:
+        if self.showing_library:
+            self._refresh_reference_library_view()
+            return
+        if self.current_samples_directory is None:
             return
         self._replace_sample_file_list(paths, f"{len(paths)} audio files")
 
+    @pyqtSlot()
+    def _reference_sync_finished(self) -> None:
+        thread = self._reference_sync_thread
+        self._reference_sync_thread = None
+        self._reference_sync_worker = None
+        if thread is not None:
+            thread.deleteLater()
+        if self._reference_sync_pending and self._reference_change_queue:
+            self._reference_sync_pending = False
+            self._reference_change_timer.start()
+
     def _populate_library_tree(self) -> None:
+        if self._library_tree_built and not self._library_tree_dirty:
+            return
+        selected_value = None
+        current_item = self.library_tree.currentItem()
+        if current_item is not None:
+            selected_value = current_item.data(0, Qt.ItemDataRole.UserRole)
+        signals_were_blocked = self.library_tree.blockSignals(True)
         self.library_tree.clear()
         folder_icon = self.folder_icon_provider.folder_icon
 
@@ -3068,8 +3781,84 @@ class AudioSplitter(QMainWindow):
         references.setIcon(0, folder_icon)
         references.setData(0, Qt.ItemDataRole.UserRole, "references")
         self.library_tree.addTopLevelItem(references)
+        for root, _recursive in self.sample_library.reference_roots():
+            root_item = QTreeWidgetItem([root.name or str(root)])
+            root_item.setIcon(0, folder_icon)
+            root_item.setData(0, Qt.ItemDataRole.UserRole, str(root))
+            references.addChild(root_item)
+            root_item.addChild(QTreeWidgetItem([""]))
         self.library_tree.expandItem(library_root)
-        self.library_tree.setCurrentItem(library_root)
+
+        def find_item(parent: QTreeWidgetItem) -> QTreeWidgetItem | None:
+            if parent.data(0, Qt.ItemDataRole.UserRole) == selected_value:
+                return parent
+            for index in range(parent.childCount()):
+                match = find_item(parent.child(index))
+                if match is not None:
+                    return match
+            return None
+
+        target = library_root
+        if selected_value is not None:
+            for index in range(self.library_tree.topLevelItemCount()):
+                match = find_item(self.library_tree.topLevelItem(index))
+                if match is not None:
+                    target = match
+                    break
+        self.library_tree.setCurrentItem(target)
+        self.library_tree.blockSignals(signals_were_blocked)
+        self._library_tree_built = True
+        self._library_tree_dirty = False
+
+    def _library_tree_expanded(self, item: QTreeWidgetItem) -> None:
+        parent = item.parent()
+        if parent is None or parent.data(0, Qt.ItemDataRole.UserRole) != "references":
+            return
+        if item.childCount() != 1 or item.child(0).text(0) != "":
+            return
+        item.takeChildren()
+        root = Path(item.data(0, Qt.ItemDataRole.UserRole))
+        root_resolved = root.resolve()
+        directory_items: dict[Path, QTreeWidgetItem] = {root_resolved: item}
+        for path in self.sample_library.reference_files():
+            try:
+                relative_parent = path.resolve().parent.relative_to(root_resolved)
+            except ValueError:
+                continue
+            parent_item = item
+            current = root_resolved
+            for part in relative_parent.parts:
+                current = current / part
+                if current not in directory_items:
+                    child = QTreeWidgetItem([part])
+                    child.setIcon(0, self.folder_icon_provider.folder_icon)
+                    child.setData(0, Qt.ItemDataRole.UserRole, str(current))
+                    directory_items[current] = child
+                    parent_item.addChild(child)
+                parent_item = directory_items[current]
+
+    def _refresh_reference_library_view(self) -> None:
+        if not self.showing_library:
+            return
+        selected_item = self.library_tree.currentItem()
+        selected_value = (
+            selected_item.data(0, Qt.ItemDataRole.UserRole)
+            if selected_item is not None
+            else None
+        )
+        selected_directory = self.current_samples_directory
+        self._populate_library_tree()
+        if selected_value == "references" or selected_directory is None:
+            self._show_references()
+        elif not self.sample_library.is_library_path(selected_directory):
+            self._show_directory(selected_directory)
+
+    def _refresh_reference_contents(self) -> None:
+        if not self.showing_library:
+            return
+        current_item = self.library_tree.currentItem()
+        if current_item is not None and current_item.data(0, Qt.ItemDataRole.UserRole) == "references":
+            self._show_references()
 
     def _library_tree_changed(self, item: QTreeWidgetItem, _column: int) -> None:
         value = item.data(0, Qt.ItemDataRole.UserRole)
@@ -3080,31 +3869,48 @@ class AudioSplitter(QMainWindow):
 
     def _show_references(self) -> None:
         self.current_samples_directory = None
+        self._library_list_directory = None
+        self._library_list_is_references = True
         self.samples_location_label.clear()
         self.samples_location_label.setVisible(False)
+        for index in range(self.library_tree.topLevelItemCount()):
+            item = self.library_tree.topLevelItem(index)
+            if item.data(0, Qt.ItemDataRole.UserRole) == "references":
+                signals_were_blocked = self.library_tree.blockSignals(True)
+                self.library_tree.setCurrentItem(item)
+                self.library_tree.blockSignals(signals_were_blocked)
+                break
         paths = self.sample_library.reference_files()
         self._replace_sample_file_list(paths, f"{len(paths)} referenced files")
 
-    def _replace_sample_file_list(self, paths: list[Path], status_text: str) -> None:
-        self.preview_player.set_file(None)
-        self.waveform_editor.set_file(None)
-        signals_were_blocked = self.sample_file_list.blockSignals(True)
-        updates_were_enabled = self.sample_file_list.updatesEnabled()
-        self.sample_file_list.setUpdatesEnabled(False)
+    def _populate_sample_file_list(self, sample_list: QListWidget, paths: list[Path]) -> None:
+        signals_were_blocked = sample_list.blockSignals(True)
+        updates_were_enabled = sample_list.updatesEnabled()
+        sample_list.setUpdatesEnabled(False)
         try:
-            self.sample_file_list.clear()
-            self.sample_file_list.addItems([audio_path.name for audio_path in paths])
+            sample_list.clear()
+            sample_list.addItems([audio_path.name for audio_path in paths])
             for index, audio_path in enumerate(paths):
-                list_item = self.sample_file_list.item(index)
+                list_item = sample_list.item(index)
                 list_item.setData(Qt.ItemDataRole.UserRole, str(audio_path))
                 if not audio_path.exists():
                     list_item.setEnabled(False)
                     list_item.setToolTip("Original file is no longer available")
         finally:
-            self.sample_file_list.setUpdatesEnabled(updates_were_enabled)
-            self.sample_file_list.blockSignals(signals_were_blocked)
+            sample_list.setUpdatesEnabled(updates_were_enabled)
+            sample_list.blockSignals(signals_were_blocked)
+
+    def _replace_sample_file_list(self, paths: list[Path], status_text: str) -> None:
+        self.preview_player.set_file(None)
+        self.waveform_editor.set_file(None)
+        self._populate_sample_file_list(self.sample_file_list, paths)
         self._filter_current_directory()
         self.samples_status.setText(status_text)
+        if self.showing_library:
+            self._library_status_text = status_text
+            self._library_list_dirty = False
+        else:
+            self._explorer_status_text = status_text
 
     def _show_directory(self, path: Path) -> None:
         if not path.is_dir():
@@ -3116,12 +3922,52 @@ class AudioSplitter(QMainWindow):
             self.sample_library.set_last_directory(path)
         self.samples_location_label.setText(str(path))
         recursive = not self.showing_library and self.scan_recursive_checkbox.isChecked()
+        if recursive:
+            resolved_path = path.resolve()
+            if any(
+                thread.isRunning()
+                and scan_path.resolve() == resolved_path
+                for thread, scan_path in self._folder_scan_paths.items()
+            ):
+                return
+        self._cancel_folder_scans(except_path=path if recursive else None)
+        # Library folders are managed on disk and must always reflect their
+        # actual contents. The reference cache is only for Explorer paths;
+        # otherwise a broad recursive reference root such as /home/sean can
+        # shadow newly created managed files in the Library.
+        cached = (
+            None
+            if self.showing_library
+            else self.sample_library.cached_files_for_directory(path, recursive)
+        )
+        if cached is not None:
+            self._folder_scan_generation += 1
+            generation = self._folder_scan_generation
+            if self.showing_library:
+                self._library_list_directory = path.resolve()
+                self._library_list_is_references = False
+            else:
+                self._explorer_list_directory = path.resolve()
+            self._replace_sample_file_list(cached, f"{len(cached)} audio files")
+            if recursive and not self.sample_library.reference_cache_complete_for_directory(path):
+                self._start_folder_scan(path, generation, preserve_existing=True)
+            return
         self._folder_scan_generation += 1
         generation = self._folder_scan_generation
         if recursive:
+            if self.showing_library:
+                self._library_list_directory = path.resolve()
+                self._library_list_is_references = False
+            else:
+                self._explorer_list_directory = path.resolve()
             self._start_folder_scan(path, generation)
             return
         paths = self.sample_library.scan_folder(path, recursive)
+        if self.showing_library:
+            self._library_list_directory = path.resolve()
+            self._library_list_is_references = False
+        else:
+            self._explorer_list_directory = path.resolve()
         self._replace_sample_file_list(paths, f"{len(paths)} audio files")
 
     def _filter_current_directory(self) -> None:
@@ -3155,7 +4001,17 @@ class AudioSplitter(QMainWindow):
 
     def _add_selected_references(self) -> None:
         paths = self._selected_sample_paths()
-        count = self.sample_library.add_references(paths)
+        root = self.current_samples_directory if self.current_samples_directory and self.current_samples_directory.is_dir() else None
+        count = self.sample_library.add_references(
+            paths,
+            reference_root=root,
+            recursive=self.scan_recursive_checkbox.isChecked() if root else False,
+        )
+        if root is not None:
+            self._watch_reference_root(root, self.scan_recursive_checkbox.isChecked())
+        self._library_tree_dirty = True
+        self._library_list_dirty = True
+        self._refresh_reference_library_view()
         self.samples_status.setText(f"Added {count} reference(s)")
 
     def _copy_selected_to_library(self) -> None:
@@ -3173,9 +4029,32 @@ class AudioSplitter(QMainWindow):
         )
 
     def _add_folder_references(self) -> None:
-        paths = self._folder_audio_paths()
-        count = self.sample_library.add_references(paths)
-        self.samples_status.setText(f"Added {count} folder reference(s)")
+        root = self.current_samples_directory or self.sample_library.last_directory
+        if not root.is_dir():
+            self.samples_status.setText("Reference folder is unavailable")
+            return
+        listed_paths = [
+            Path(item.data(Qt.ItemDataRole.UserRole))
+            for index in range(self.sample_file_list.count())
+            if (item := self.sample_file_list.item(index))
+            and item.data(Qt.ItemDataRole.UserRole)
+        ]
+        self.sample_library.register_reference_root(
+            root,
+            recursive=self.scan_recursive_checkbox.isChecked(),
+        )
+        self._library_tree_dirty = True
+        self._library_list_dirty = True
+        self._watch_reference_root(root, self.scan_recursive_checkbox.isChecked())
+        count = self.sample_library.add_references(
+            listed_paths,
+            reference_root=root,
+            recursive=self.scan_recursive_checkbox.isChecked(),
+        )
+        self.samples_status.setText(
+            f"Updating folder references in background ({count} cached immediately)..."
+        )
+        self._refresh_reference_library_view()
 
     def _copy_folder_to_library(self) -> None:
         paths = self._folder_audio_paths()
@@ -3286,7 +4165,11 @@ class AudioSplitter(QMainWindow):
     def _refresh_library(self, selected: Path | None = None) -> None:
         if not self.showing_library:
             return
-        self.sample_library.sync_legacy_additions()
+        self._library_tree_dirty = True
+        current_item = self.library_tree.currentItem()
+        if current_item is not None and current_item.data(0, Qt.ItemDataRole.UserRole) == "references":
+            self._refresh_reference_library_view()
+            return
         selected = selected or self.current_samples_directory or self.sample_library.root
         if not selected.is_dir() or not self.sample_library.is_library_path(selected):
             selected = self.sample_library.root
@@ -3295,6 +4178,7 @@ class AudioSplitter(QMainWindow):
 
     def _recording_saved(self, path: Path) -> None:
         self.sample_library.add_recorded(path)
+        self._library_tree_dirty = True
         self.samples_status.setText(f"Saved {path.name}")
         self.preview_player.set_file(path)
         self.waveform_editor.set_file(path)
@@ -3447,6 +4331,16 @@ class AudioSplitter(QMainWindow):
         self.choose_button.setEnabled(True)
 
     def closeEvent(self, event) -> None:
+        self._reference_change_timer.stop()
+        for thread in list(self._folder_scan_threads):
+            thread.requestInterruption()
+        for thread in list(self._folder_scan_threads):
+            thread.quit()
+            thread.wait(1500)
+        if self._reference_sync_thread and self._reference_sync_thread.isRunning():
+            self._reference_sync_thread.requestInterruption()
+            self._reference_sync_thread.quit()
+            self._reference_sync_thread.wait(1500)
         for card in self.cards.values():
             card.close_player()
         self.recording_panel.close_recording()
@@ -3571,6 +4465,12 @@ def apply_style(app: QApplication, light_mode: bool = False) -> None:
     font.setStyleHint(QFont.StyleHint.SansSerif)
     app.setFont(font)
 
+    split_background = "#ff7a00"
+    split_foreground = "#000000"
+    split_hover_background = "#d96600"
+    split_hover_foreground = "#ffffff"
+    split_pressed_background = "#bd5900"
+
     stylesheet = f"""
         QWidget {{
             background: #000000;
@@ -3665,6 +4565,30 @@ def apply_style(app: QApplication, light_mode: bool = False) -> None:
             color: #ffffff;
             border-color: #ffffff;
         }}
+        QPushButton#splitButton,
+        QPushButton#chooseButton {{
+            background: {split_background};
+            color: {split_foreground};
+            border-color: {split_background};
+        }}
+        QPushButton#splitButton:hover,
+        QPushButton#chooseButton:hover {{
+            background: {split_hover_background};
+            color: {split_hover_foreground};
+            border-color: {split_hover_background};
+        }}
+        QPushButton#splitButton:pressed,
+        QPushButton#chooseButton:pressed {{
+            background: {split_pressed_background};
+            color: {split_hover_foreground};
+            border-color: {split_pressed_background};
+        }}
+        QPushButton#splitButton:disabled,
+        QPushButton#chooseButton:disabled {{
+            background: #000000;
+            color: #ffffff;
+            border-color: #ffffff;
+        }}
         QLineEdit, QComboBox {{
             background: #000000;
             color: #ffffff;
@@ -3730,7 +4654,7 @@ def apply_style(app: QApplication, light_mode: bool = False) -> None:
             text-align: center;
         }}
         QProgressBar::chunk {{
-            background: #ffffff;
+            background: #ff7a00;
         }}
         QSlider::groove:horizontal {{
             background: #000000;
