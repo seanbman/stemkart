@@ -27,6 +27,7 @@ The application expects these tools for the associated features:
 
 - FFmpeg for audio playback/decoding paths.
 - Rubber Band CLI for independent pitch and time processing.
+- aubio for offline tempo/beat detection during sample analysis.
 - PipeWire's `pw-dump`, `pw-record`, and `pw-link` for system/application recording.
 
 ## 1.3 Useful project files

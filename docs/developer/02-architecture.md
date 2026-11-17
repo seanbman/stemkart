@@ -21,7 +21,7 @@ The application uses XDG locations through `app_data_dir()` and `app_config_dir(
 
 ## 2.3 Audio processing
 
-The Effects tab renders asynchronously through `EffectRenderWorker`. `effects.py` applies the reorderable effects chain and invokes the Rubber Band CLI when pitch or speed differs from the defaults. Octave and Key are combined into total semitones; Speed is passed independently as tempo/time-stretch.
+The Effects tab renders asynchronously through `EffectRenderWorker`. `effects.py` applies the reorderable effects chain and invokes the Rubber Band CLI when pitch or tempo differs from the defaults. Octave and Key are combined into total semitones; the BPM control is converted to `target_bpm / detected_bpm` and passed independently as time-stretch.
 
 Demucs splitting runs through a worker thread and invokes the Python Demucs module using the active interpreter. Generated stems are temporary until an export action persists them.
 

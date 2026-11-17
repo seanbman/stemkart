@@ -4,4 +4,5 @@
 PyQt6>=6.6
 demucs>=4.0.1
 numpy>=1.26,<3
+aubio>=0.4.9,<0.5
 torch==2.5.1+cpu

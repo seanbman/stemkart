@@ -27,6 +27,7 @@ from effects import (
     process_time_pitch,
     write_wav,
 )
+from key_detection import detect_bpm, detect_pitch_class, pitch_class_name
 
 from PyQt6.QtCore import QFile, QDir, QEvent, QIODevice, QFileInfo, QFileSystemWatcher, QSignalBlocker, QThread, QTimer, QUrl, Qt, QSize, QObject, QPointF, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import (
@@ -525,6 +526,18 @@ def wav_availability(path: Path, threshold_dbfs: float = -60.0) -> str:
 def format_time(milliseconds: int) -> str:
     seconds = max(0, milliseconds // 1000)
     return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def format_time_precise(milliseconds: int) -> str:
+    """Format milliseconds as ``minutes:seconds.milliseconds``."""
+    total = max(0, int(milliseconds))
+    minutes, remainder = divmod(total, 60_000)
+    seconds, millis = divmod(remainder, 1_000)
+    return f"{minutes}:{seconds:02d}.{millis:03d}"
+
+
+def format_trim_range(start_ms: int, end_ms: int) -> str:
+    return f"Trim: {format_time_precise(start_ms)}-{format_time_precise(end_ms)}"
 
 
 def is_audio_file(path: Path) -> bool:
@@ -1937,8 +1950,8 @@ class WaveformEditor(QGroupBox):
         controls = QHBoxLayout()
         controls.setSpacing(3)
         controls.setContentsMargins(0, 0, 0, 0)
-        self.playback_time_label = QLabel("0:00 - 0:00")
-        self.playback_time_label.setFixedWidth(106)
+        self.playback_time_label = QLabel("0:00.000 - 0:00.000")
+        self.playback_time_label.setFixedWidth(150)
         self.playback_time_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.playback_time_label.setToolTip("Current playback position and total duration")
         controls.addWidget(self.playback_time_label)
@@ -1950,8 +1963,8 @@ class WaveformEditor(QGroupBox):
         self.set_end_button.setToolTip("Set the end marker to the current playhead position")
         self.set_end_button.clicked.connect(self._set_end_from_playhead)
         controls.addWidget(self.set_end_button)
-        self.range_label = QLabel("Full file")
-        self.range_label.setFixedWidth(106)
+        self.range_label = QLabel(format_trim_range(0, 0))
+        self.range_label.setFixedWidth(190)
         self.range_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.range_label.setToolTip("Trim start and end")
         controls.addWidget(self.range_label)
@@ -2074,7 +2087,9 @@ class WaveformEditor(QGroupBox):
 
     def set_playhead(self, position_ms: int, duration_ms: int) -> None:
         self.waveform.set_playhead(position_ms, duration_ms)
-        self.playback_time_label.setText(f"{format_time(position_ms)} - {format_time(duration_ms)}")
+        self.playback_time_label.setText(
+            f"{format_time_precise(position_ms)} - {format_time_precise(duration_ms)}"
+        )
         self._set_action_state(bool(self.samples.size))
 
     def _set_start_from_playhead(self) -> None:
@@ -2121,7 +2136,8 @@ class WaveformEditor(QGroupBox):
         self.undo_state = None
         self.waveform.set_samples(self.samples, self.sample_rate)
         self.samples_changed.emit(self.samples, self.sample_rate, self.working_name)
-        self.playback_time_label.setText("0:00 - 0:00")
+        self.playback_time_label.setText("0:00.000 - 0:00.000")
+        self.range_label.setText(format_trim_range(0, 0))
         self._set_action_state(False)
         if not self.file_path:
             self.file_label.clear()
@@ -2154,12 +2170,12 @@ class WaveformEditor(QGroupBox):
     def _range_changed(self, start: int, end: int) -> None:
         self.selection_changed.emit(start, end)
         if not self.samples.size:
-            self.range_label.setText("Full file")
+            self.range_label.setText(format_trim_range(0, 0))
             self._set_action_state(False)
             return
         start_ms = round(start / self.sample_rate * 1000)
         end_ms = round(end / self.sample_rate * 1000)
-        self.range_label.setText(f"{format_time(start_ms)} - {format_time(end_ms)}")
+        self.range_label.setText(format_trim_range(start_ms, end_ms))
         self._set_action_state(True)
         self.zoom_button.setEnabled(self.waveform.end_ratio - self.waveform.start_ratio < 0.999)
         self.reset_zoom_button.setEnabled(
@@ -2299,6 +2315,30 @@ class EffectRenderWorker(QThread):
         self.rendered.emit(self.serial, rendered, self.sample_rate)
 
 
+class KeyDetectionWorker(QThread):
+    detected = pyqtSignal(int, float)
+    unknown = pyqtSignal()
+    bpm_detected = pyqtSignal(float, float)
+    bpm_unknown = pyqtSignal()
+
+    def __init__(self, samples: np.ndarray, sample_rate: int) -> None:
+        super().__init__()
+        self.samples = samples
+        self.sample_rate = sample_rate
+
+    def run(self) -> None:
+        result = detect_pitch_class(self.samples, self.sample_rate)
+        if result is None or result[1] < 0.08:
+            self.unknown.emit()
+        else:
+            self.detected.emit(result[0], result[1])
+        bpm_result = detect_bpm(self.samples, self.sample_rate)
+        if bpm_result is None or bpm_result[1] < 0.08:
+            self.bpm_unknown.emit()
+        else:
+            self.bpm_detected.emit(bpm_result[0], bpm_result[1])
+
+
 class EffectModeComboBox(QComboBox):
     """Mode dropdown whose closed state never paints a selected-item highlight."""
 
@@ -2411,40 +2451,130 @@ class EffectRow(QWidget):
         super().mousePressEvent(event)
 
 
+def dial_angle_degrees(
+    value: int,
+    minimum: int,
+    maximum: int,
+    neutral_value: int | None = None,
+) -> float:
+    """Map a bounded dial value to a physical marker angle.
+
+    The neutral value is always exactly 90 degrees (12 o'clock, with 0 at
+    3 o'clock). Values below and above it occupy the two halves of a
+    270-degree, non-wrapping sweep.
+    """
+    if maximum <= minimum:
+        return 0.0
+    neutral = float((minimum + maximum) / 2 if neutral_value is None else neutral_value)
+    neutral = max(float(minimum), min(float(maximum), neutral))
+    bounded = max(float(minimum), min(float(maximum), float(value)))
+    if bounded <= neutral:
+        span = max(neutral - minimum, 1.0)
+        return 225.0 - ((bounded - minimum) / span) * 135.0
+    span = max(maximum - neutral, 1.0)
+    return 90.0 - ((bounded - neutral) / span) * 135.0
+
+
+def dial_value_from_angle(
+    angle_degrees: float,
+    minimum: int,
+    maximum: int,
+    neutral_value: int | None = None,
+) -> int:
+    """Map a cursor angle to the nearest value on the clockwise dial sweep."""
+    if maximum <= minimum:
+        return minimum
+    neutral = float((minimum + maximum) / 2 if neutral_value is None else neutral_value)
+    neutral = max(float(minimum), min(float(maximum), neutral))
+    angle = float(angle_degrees) % 360.0
+    if 90.0 <= angle <= 225.0:
+        ratio = (225.0 - angle) / 135.0
+        return round(minimum + ratio * (neutral - minimum))
+    if angle < 90.0:
+        ratio = (90.0 - angle) / 135.0
+        return round(neutral + ratio * (maximum - neutral))
+    if angle >= 315.0:
+        ratio = (450.0 - angle) / 135.0
+        return round(neutral + ratio * (maximum - neutral))
+    return minimum if angle < 270.0 else maximum
+
+
+def dial_value_from_horizontal_drag(
+    start_value: int,
+    delta_x: float,
+    pixels_per_step: float,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Apply a right-positive horizontal drag without allowing wraparound."""
+    steps = int(round(delta_x / max(1.0, float(pixels_per_step))))
+    return max(minimum, min(maximum, start_value + steps))
+
+
+def bpm_value_from_detection(
+    detected_bpm: float,
+    minimum: int = 0,
+    maximum: int = 240,
+) -> int:
+    """Round and clamp a detected BPM to the dial's 0-240 range."""
+    return max(minimum, min(maximum, round(float(detected_bpm))))
+
+
 class PhysicalDial(QDial):
     """Transparent physical-style dial with an outlined ring and marker."""
 
-    def __init__(self, parent: QWidget | None = None, drag_pixels_per_step: float = 12.0) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        drag_pixels_per_step: float = 12.0,
+        neutral_value: int | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWrapping(False)
         self.drag_pixels_per_step = max(1.0, float(drag_pixels_per_step))
-        self._drag_start_y: float | None = None
+        self.neutral_value = neutral_value
+        self._drag_start_pos: QPointF | None = None
         self._drag_start_value = 0
+
+    def set_neutral_value(self, value: int | None) -> None:
+        self.neutral_value = value
+        self.update()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.setFocus(Qt.FocusReason.MouseFocusReason)
-            self._drag_start_y = event.position().y()
+            self._drag_start_pos = event.position()
             self._drag_start_value = self.value()
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        if self._drag_start_y is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            # Use bounded vertical drag semantics instead of Qt's circular
-            # mouse tracking, so crossing the top/bottom never wraps.
-            delta = self._drag_start_y - event.position().y()
-            steps = int(round(delta / self.drag_pixels_per_step))
-            value = max(self.minimum(), min(self.maximum(), self._drag_start_value + steps))
+        if self._drag_start_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            delta_x = event.position().x() - self._drag_start_pos.x()
+            delta_y = event.position().y() - self._drag_start_pos.y()
+            if abs(delta_x) >= abs(delta_y):
+                value = dial_value_from_horizontal_drag(
+                    self._drag_start_value,
+                    delta_x,
+                    self.drag_pixels_per_step,
+                    self.minimum(),
+                    self.maximum(),
+                )
+            else:
+                bounds = self.rect().adjusted(7, 7, -7, -7)
+                center = bounds.center()
+                angle = np.degrees(np.arctan2(center.y() - event.position().y(), event.position().x() - center.x()))
+                value = dial_value_from_angle(angle, self.minimum(), self.maximum(), self.neutral_value)
+            value = max(self.minimum(), min(self.maximum(), value))
             self.setSliderPosition(value)
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self._drag_start_y is not None:
-            self._drag_start_y = None
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_start_pos is not None:
+            self._drag_start_pos = None
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -2461,14 +2591,18 @@ class PhysicalDial(QDial):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(center, radius, radius)
 
-        ratio = (self.sliderPosition() - self.minimum()) / max(1, self.maximum() - self.minimum())
-        # Sweep from the lower-left through 12 o'clock to the lower-right.
-        # This puts a neutral value at the physical-looking top position.
-        angle = np.deg2rad(135.0 + ratio * 270.0)
+        angle = np.deg2rad(
+            dial_angle_degrees(
+                self.sliderPosition(),
+                self.minimum(),
+                self.maximum(),
+                self.neutral_value,
+            )
+        )
         marker_start = radius * 0.18
         marker_end = radius * 0.72
-        start = center + QPointF(float(np.cos(angle) * marker_start), float(np.sin(angle) * marker_start))
-        end = center + QPointF(float(np.cos(angle) * marker_end), float(np.sin(angle) * marker_end))
+        start = center + QPointF(float(np.cos(angle) * marker_start), float(-np.sin(angle) * marker_start))
+        end = center + QPointF(float(np.cos(angle) * marker_end), float(-np.sin(angle) * marker_end))
         painter.setPen(QPen(color, 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.drawLine(start, end)
         painter.end()
@@ -2486,39 +2620,75 @@ class KnobControl(QWidget):
         formatter: Callable[[int], str],
         parent: QWidget | None = None,
         drag_pixels_per_step: float = 12.0,
+        neutral_value: int | None = None,
+        value_parser: Callable[[str], int] | None = None,
     ) -> None:
         super().__init__(parent)
         self.formatter = formatter
+        self.display_formatter = formatter
+        self.value_parser = value_parser or (lambda text: int(text.strip()))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(2)
         title = QLabel(label)
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
-        self.dial = PhysicalDial(drag_pixels_per_step=drag_pixels_per_step)
+        self.dial = PhysicalDial(
+            drag_pixels_per_step=drag_pixels_per_step,
+            neutral_value=neutral_value,
+        )
         self.dial.setRange(minimum, maximum)
         self.dial.setValue(value)
         self.dial.setNotchesVisible(True)
         self.dial.setWrapping(False)
         self.dial.setFixedSize(76, 76)
-        self.dial.setToolTip(f"{label}: {formatter(value)}")
+        self.dial.setToolTip(f"{label}: {self.display_formatter(value)}")
         self.dial.valueChanged.connect(self._value_changed)
         layout.addWidget(self.dial, 0, Qt.AlignmentFlag.AlignHCenter)
-        self.value_label = QLabel(formatter(value))
-        self.value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.value_label)
+        self.value_edit = QLineEdit(self.display_formatter(value))
+        self.value_edit.setObjectName("knobValueEdit")
+        self.value_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.value_edit.setFixedWidth(92)
+        self.value_edit.setMaxLength(12)
+        self.value_edit.setToolTip("Type a value and press Enter")
+        self.value_edit.editingFinished.connect(self._commit_text_value)
+        layout.addWidget(self.value_edit, 0, Qt.AlignmentFlag.AlignHCenter)
 
     def _value_changed(self, value: int) -> None:
-        rendered = self.formatter(value)
-        self.value_label.setText(rendered)
-        self.dial.setToolTip(f"{self.layout().itemAt(0).widget().text()}: {rendered}")
+        self._refresh_display(value)
         self.changed.emit()
+
+    def _refresh_display(self, value: int) -> None:
+        rendered = self.display_formatter(value)
+        self.value_edit.setText(rendered)
+        self.dial.setToolTip(f"{self.layout().itemAt(0).widget().text()}: {rendered}")
+
+    def set_display_formatter(self, formatter: Callable[[int], str]) -> None:
+        self.display_formatter = formatter
+        self._value_changed(self.dial.value())
+
+    def _commit_text_value(self) -> None:
+        try:
+            requested = self.value_parser(self.value_edit.text())
+        except (TypeError, ValueError):
+            self.value_edit.setText(self.display_formatter(self.dial.value()))
+            return
+        bounded = max(self.dial.minimum(), min(self.dial.maximum(), requested))
+        self.dial.setValue(bounded)
+        self.value_edit.setText(self.display_formatter(bounded))
 
     def value(self) -> int:
         return self.dial.value()
 
     def setValue(self, value: int) -> None:
         self.dial.setValue(value)
+        # Detection and other programmatic updates may intentionally block
+        # valueChanged while recalibrating the dial. Keep the editable field
+        # synchronized even when that signal is suppressed.
+        self._refresh_display(self.dial.value())
+
+    def set_neutral_value(self, value: int | None) -> None:
+        self.dial.set_neutral_value(value)
 
 
 class EffectsPanel(QWidget):
@@ -2532,11 +2702,16 @@ class EffectsPanel(QWidget):
         self.source_samples = np.array([], dtype=np.float32)
         self.source_rate = 44100
         self.source_name = ""
+        self.rendered_duration_ms = 0
         self.selection = (0, 0)
         self.chain = default_chain()
         self.octave = 0
         self.key = 0
-        self.speed_percent = 100
+        self.target_bpm = 120
+        self.detected_key_pitch_class: int | None = None
+        self.detected_bpm: float | None = None
+        self.key_detection_serial = 0
+        self.key_detection_worker: KeyDetectionWorker | None = None
         self.formant_preservation = False
         self._render_serial = 0
         self._render_workers: list[EffectRenderWorker] = []
@@ -2562,7 +2737,7 @@ class EffectsPanel(QWidget):
 
         self.preview_player = PreviewPlayer(self)
         self.preview_player.setVisible(False)
-        self.preview_player.playhead_changed.connect(self.waveform.set_playhead)
+        self.preview_player.playhead_changed.connect(self._preview_playhead_changed)
         self.waveform.playhead_requested.connect(self.preview_player.seek_absolute)
 
         transport = QHBoxLayout()
@@ -2600,17 +2775,35 @@ class EffectsPanel(QWidget):
         transform_group = QGroupBox("Pitch / Time")
         transform_layout = QHBoxLayout(transform_group)
         transform_layout.setContentsMargins(4, 4, 4, 4)
-        self.octave_knob = KnobControl("Octave", -4, 4, 0, lambda value: f"{value:+d}")
-        self.key_knob = KnobControl("Key", -12, 12, 0, lambda value: f"{value:+d} st")
-        self.speed_knob = KnobControl(
-            "Speed",
-            25,
-            200,
-            100,
-            lambda value: f"{value / 100.0:.2f}x",
-            drag_pixels_per_step=8.0,
+        self.octave_knob = KnobControl(
+            "Octave",
+            -4,
+            4,
+            0,
+            lambda value: f"{value:+d}",
+            neutral_value=0,
+            value_parser=lambda text: int(text.strip()),
         )
-        for knob in (self.octave_knob, self.key_knob, self.speed_knob):
+        self.key_knob = KnobControl(
+            "Key",
+            -12,
+            12,
+            0,
+            self._format_key_value,
+            neutral_value=0,
+            value_parser=self._parse_key_value,
+        )
+        self.bpm_knob = KnobControl(
+            "BPM",
+            0,
+            240,
+            120,
+            lambda value: f"{value} BPM",
+            drag_pixels_per_step=2.0,
+            neutral_value=120,
+            value_parser=lambda text: round(float(text.strip().lower().removesuffix("bpm").strip())),
+        )
+        for knob in (self.octave_knob, self.key_knob, self.bpm_knob):
             knob.changed.connect(self._transform_changed)
             transform_layout.addWidget(knob)
         transform_layout.addStretch()
@@ -2711,12 +2904,118 @@ class EffectsPanel(QWidget):
         self._schedule_render()
 
     def set_source(self, samples: np.ndarray, sample_rate: int, name: str) -> None:
+        self.key_detection_serial += 1
+        if self.key_detection_worker is not None and self.key_detection_worker.isRunning():
+            self.key_detection_worker.requestInterruption()
         self.source_samples = np.asarray(samples, dtype=np.float32).reshape(-1).copy()
         self.source_rate = max(1, int(sample_rate))
         self.source_name = name
+        self.rendered_duration_ms = 0
         self.selection = (0, len(self.source_samples))
+        self.detected_key_pitch_class = None
+        self.detected_bpm = None
+        self.key = 0
+        self.target_bpm = 120
+        blocker = QSignalBlocker(self.key_knob.dial)
+        self.key_knob.setValue(0)
+        del blocker
+        blocker = QSignalBlocker(self.bpm_knob.dial)
+        self.bpm_knob.set_neutral_value(120)
+        self.bpm_knob.setValue(self.target_bpm)
+        del blocker
+        self.key_knob.set_display_formatter(self._format_key_value)
         self.source_label.setText(name or "Select an audio file in Samples")
+        if self.source_samples.size:
+            serial = self.key_detection_serial
+            worker = KeyDetectionWorker(self.source_samples.copy(), self.source_rate)
+            worker.detected.connect(lambda pitch_class, confidence, serial=serial: self._key_detected(serial, pitch_class, confidence))
+            worker.unknown.connect(lambda serial=serial: self._key_unknown(serial))
+            worker.bpm_detected.connect(lambda bpm, confidence, serial=serial: self._bpm_detected(serial, bpm, confidence))
+            worker.bpm_unknown.connect(lambda serial=serial: self._bpm_unknown(serial))
+            worker.finished.connect(lambda worker=worker: self._key_worker_finished(worker))
+            self.key_detection_worker = worker
+            worker.start()
         self._schedule_render()
+
+    def _format_key_value(self, value: int) -> str:
+        if self.detected_key_pitch_class is None:
+            return f"{value:+d} st"
+        return pitch_class_name(self.detected_key_pitch_class + value)
+
+    def _parse_key_value(self, text: str) -> int:
+        normalized = text.strip().upper().replace("♯", "#")
+        if normalized.endswith("ST"):
+            return int(normalized[:-2].strip())
+        if self.detected_key_pitch_class is None:
+            return int(normalized)
+        names = {pitch_class_name(index).upper(): index for index in range(12)}
+        if normalized in names:
+            target = names[normalized]
+            raw = (target - self.detected_key_pitch_class) % 12
+            return raw - 12 if raw > 6 else raw
+        return int(normalized)
+
+    def _key_detected(self, serial: int, pitch_class: int, confidence: float) -> None:
+        if serial != self.key_detection_serial:
+            return
+        self.detected_key_pitch_class = int(pitch_class) % 12
+        self.key = 0
+        blocker = QSignalBlocker(self.key_knob.dial)
+        self.key_knob.setValue(0)
+        del blocker
+        self.key_knob.set_display_formatter(self._format_key_value)
+        self.key_knob.dial.setToolTip(
+            f"Detected key: {pitch_class_name(self.detected_key_pitch_class)}; right/clockwise raises pitch"
+        )
+        self.status_label.setText(
+            f"Preview ready · key {pitch_class_name(self.detected_key_pitch_class)} ({confidence:.0%} confidence)"
+        )
+
+    def _key_unknown(self, serial: int) -> None:
+        if serial == self.key_detection_serial:
+            self.detected_key_pitch_class = None
+            self.key_knob.set_display_formatter(self._format_key_value)
+
+    def _key_worker_finished(self, worker: KeyDetectionWorker) -> None:
+        if self.key_detection_worker is worker:
+            self.key_detection_worker = None
+        worker.deleteLater()
+
+    def _bpm_detected(self, serial: int, bpm: float, confidence: float) -> None:
+        if serial != self.key_detection_serial:
+            return
+        self.detected_bpm = float(
+            bpm_value_from_detection(
+                bpm,
+                self.bpm_knob.dial.minimum(),
+                self.bpm_knob.dial.maximum(),
+            )
+        )
+        self.target_bpm = int(self.detected_bpm)
+        blocker = QSignalBlocker(self.bpm_knob.dial)
+        # Keep 120 BPM as the fixed top/neutral reference. The detected value
+        # itself must determine the marker angle and editable field value.
+        self.bpm_knob.set_neutral_value(120)
+        self.bpm_knob.setValue(self.target_bpm)
+        del blocker
+        self.bpm_knob.dial.setToolTip(
+            f"Detected tempo: {int(self.detected_bpm)} BPM; right/clockwise increases tempo"
+        )
+        self._schedule_render()
+
+    def _bpm_unknown(self, serial: int) -> None:
+        if serial != self.key_detection_serial:
+            return
+        self.detected_bpm = None
+        self.target_bpm = 120
+        blocker = QSignalBlocker(self.bpm_knob.dial)
+        self.bpm_knob.set_neutral_value(120)
+        self.bpm_knob.setValue(120)
+        del blocker
+
+    def _time_stretch_ratio(self) -> float:
+        source_bpm = self.detected_bpm or 120.0
+        return max(0.25, min(2.0, self.target_bpm / source_bpm))
 
     def set_selection(self, start: int, end: int) -> None:
         total = len(self.source_samples)
@@ -2726,7 +3025,7 @@ class EffectsPanel(QWidget):
     def _transform_changed(self) -> None:
         self.octave = self.octave_knob.value()
         self.key = self.key_knob.value()
-        self.speed_percent = self.speed_knob.value()
+        self.target_bpm = self.bpm_knob.value()
         self._schedule_render()
 
     def _formant_changed(self, enabled: bool) -> None:
@@ -2742,6 +3041,7 @@ class EffectsPanel(QWidget):
         start, end = self.selection
         samples = self.source_samples[start:end].copy()
         if not samples.size:
+            self.rendered_duration_ms = 0
             self.waveform.set_samples(np.array([], dtype=np.float32), self.source_rate)
             self.preview_player.set_file(None)
             self.save_effected_button.setEnabled(False)
@@ -2754,7 +3054,7 @@ class EffectsPanel(QWidget):
             [EffectState(item.effect_id, item.amount, item.mode) for item in self.chain],
             self.octave,
             self.key,
-            self.speed_percent / 100.0,
+            self._time_stretch_ratio(),
             self.formant_preservation,
         )
         worker.rendered.connect(self._render_finished)
@@ -2772,6 +3072,10 @@ class EffectsPanel(QWidget):
     def _render_finished(self, serial: int, samples: np.ndarray, sample_rate: int) -> None:
         if serial != self._render_serial:
             return
+        # The waveform and transport must share the exact duration of the
+        # rendered BPM-adjusted audio, not a stale duration from the previous
+        # QMediaPlayer source while it is being replaced.
+        self.rendered_duration_ms = round(len(samples) / max(1, sample_rate) * 1000)
         self.waveform.set_samples(samples, sample_rate)
         preview_path = self._preview_dir / "effects-preview.wav"
         write_wav(preview_path, samples, sample_rate)
@@ -2814,7 +3118,7 @@ class EffectsPanel(QWidget):
             "chain": [state.to_dict() for state in self.chain],
             "octave": self.octave,
             "key": self.key,
-            "speed_percent": self.speed_percent,
+            "bpm": self.target_bpm,
             "formant_preservation": self.formant_preservation,
         }
         self._save_presets()
@@ -2833,27 +3137,31 @@ class EffectsPanel(QWidget):
             self.chain = chain_from_dicts(record)
             octave = 0
             key = 0
-            speed_percent = 100
+            bpm = 120
             formant_preservation = False
         elif isinstance(record, dict):
             self.chain = chain_from_dicts(record.get("chain"))
             try:
                 octave = max(-4, min(4, int(record.get("octave", 0))))
                 key = max(-12, min(12, int(record.get("key", 0))))
-                speed_percent = max(25, min(200, int(record.get("speed_percent", 100))))
+                if "bpm" in record:
+                    bpm = max(0, min(300, int(record.get("bpm", 120))))
+                else:
+                    legacy_speed = max(25, min(200, int(record.get("speed_percent", 100))))
+                    bpm = round(120 * legacy_speed / 100.0)
             except (TypeError, ValueError):
-                octave, key, speed_percent = 0, 0, 100
+                octave, key, bpm = 0, 0, 120
             formant_preservation = bool(record.get("formant_preservation", False))
         else:
             return
         self.octave = octave
         self.key = key
-        self.speed_percent = speed_percent
+        self.target_bpm = bpm
         self.formant_preservation = formant_preservation
         for knob, value in (
             (self.octave_knob, octave),
             (self.key_knob, key),
-            (self.speed_knob, speed_percent),
+            (self.bpm_knob, bpm),
         ):
             blocker = QSignalBlocker(knob.dial)
             knob.setValue(value)
@@ -2865,6 +3173,10 @@ class EffectsPanel(QWidget):
         self._rebuild_chain()
         self._schedule_render()
         self.status_label.setText(f"Loaded preset: {name}")
+
+    def _preview_playhead_changed(self, position_ms: int, duration_ms: int) -> None:
+        duration = self.rendered_duration_ms or duration_ms
+        self.waveform.set_playhead(position_ms, duration)
 
     def _delete_preset(self) -> None:
         name = self.preset_combo.currentText().strip()
@@ -2890,7 +3202,7 @@ class EffectsPanel(QWidget):
                 self.source_rate,
                 self.octave,
                 self.key,
-                self.speed_percent / 100.0,
+                self._time_stretch_ratio(),
                 self.formant_preservation,
             )
             rendered = process_chain(transformed, self.source_rate, self.chain)
@@ -2905,6 +3217,9 @@ class EffectsPanel(QWidget):
     def close_panel(self) -> None:
         self.render_timer.stop()
         self.preview_player.close_player()
+        if self.key_detection_worker is not None and self.key_detection_worker.isRunning():
+            self.key_detection_worker.requestInterruption()
+            self.key_detection_worker.wait(1500)
         for worker in list(self._render_workers):
             worker.requestInterruption()
             worker.wait(1500)
@@ -5301,6 +5616,9 @@ def apply_style(app: QApplication, light_mode: bool = False) -> None:
         QLineEdit#directorySearch {{
             padding-left: 4px;
         }}
+        QLineEdit#knobValueEdit {{
+            padding: 1px 2px;
+        }}
         QComboBox {{
             padding-left: 4px;
         }}
@@ -5432,6 +5750,13 @@ def apply_style(app: QApplication, light_mode: bool = False) -> None:
             "#000000", "__STEMKART_BLACK__"
         ).replace("#ffffff", "#000000").replace("__STEMKART_BLACK__", "#ffffff")
         stylesheet += """
+        QLineEdit#knobValueEdit {
+            background: #ffffff;
+            color: #000000;
+            border: 1px solid #000000;
+            selection-background-color: #000000;
+            selection-color: #ffffff;
+        }
         QPushButton#transportButton:hover,
         QPushButton#transportButton:pressed,
         QPushButton#transportButton:checked,
@@ -5445,6 +5770,13 @@ def apply_style(app: QApplication, light_mode: bool = False) -> None:
         """
     else:
         stylesheet += """
+        QLineEdit#knobValueEdit {
+            background: transparent;
+            color: #ffffff;
+            border: 1px solid #ffffff;
+            selection-background-color: #ffffff;
+            selection-color: #000000;
+        }
         QPushButton#transportButton:hover,
         QPushButton#transportButton:pressed,
         QPushButton#transportButton:checked,

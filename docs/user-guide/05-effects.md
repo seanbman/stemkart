@@ -12,12 +12,14 @@ The controls above the effect chain are physical-style dials:
 
 - **Octave**: coarse pitch shift from -4 to +4 octaves.
 - **Key**: fine pitch shift from -12 to +12 semitones.
-- **Speed**: time-stretch multiplier from 0.25× to 2.00× without changing pitch.
+- **BPM**: integer target tempo from 0 to 300 BPM. The detected source tempo is placed at the dial's 90° center; changing BPM time-stretches without changing pitch.
 - **Preserve formants**: optional formant preservation during pitch shifting.
 
-Octave and Key combine into one total semitone shift. Rubber Band performs the decoupled pitch and speed processing.
+Octave and Key combine into one total semitone shift. Rubber Band performs the decoupled pitch and tempo processing. If no reliable tempo is detected, 120 BPM is used as the neutral reference.
 
-Click a dial and use the mouse or arrow keys for adjustment. Dials stop at their minimum and maximum values.
+Drag a dial to the right to increase its value and to the left to decrease it. You can also turn the dial with a clockwise rotary drag or use the arrow keys after focusing it. Dials stop at their minimum and maximum values.
+
+When the active sample has a consistent tonal center, StemKart detects its pitch class in the background. The Key dial then shows that original pitch class at its 90° center position; moving left lowers it by semitones and moving right raises it. Uncertain or atonal samples retain the numeric `st` display.
 
 ## 5.3 Effect chain
 

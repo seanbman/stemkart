@@ -8,7 +8,7 @@ StemKart is intended to be distributed under the GNU General Public License, ver
 
 ## 5.2 Python dependencies
 
-Record the licenses and required notices for PyQt6, Demucs, NumPy, PyTorch, and their transitive dependencies in the release process. The exact notice set should be generated or reviewed from the versions actually shipped.
+Record the licenses and required notices for PyQt6, Demucs, NumPy, aubio, PyTorch, and their transitive dependencies in the release process. The exact notice set should be generated or reviewed from the versions actually shipped.
 
 ## 5.3 FFmpeg
 
